@@ -56,6 +56,8 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         GLES30.glClearColor(0.075f, 0.086f, 0.102f, 1f);
         GLES30.glEnable(GLES30.GL_DEPTH_TEST);
         GLES30.glEnable(GLES30.GL_CULL_FACE);
+        // AVS Surface Truth contract: extractor emits outward CCW faces.
+        GLES30.glFrontFace(GLES30.GL_CCW);
         GLES30.glCullFace(GLES30.GL_BACK);
 
         program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER);

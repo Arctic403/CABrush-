@@ -1,17 +1,16 @@
-# CABrush AVS 0.1
+# CABrush AVS 0.1.1 — Surface Truth
 
-CABrush has pivoted away from mutable-triangle sculpting.
+CABrush uses **AVS (Adaptive Volume Surface)**: the sculpt is a sparse signed-distance field and triangles are disposable rendering cache.
 
-**The mesh is no longer the sculpt.**
+AVS 0.1.1 deliberately freezes feature work and hardens one thing only:
 
-AVS (Adaptive Volume Surface) stores the model as a sparse signed-distance
-volume. Triangles are disposable render cache generated from that field.
+> **field -> surface conversion must stay closed, consistently wound and deterministic under Android back-face culling.**
 
-Runtime stays intentionally tiny:
+Runtime remains intentionally tiny:
 
-- one sphere
-- Clay +
-- Clay -
+- sphere
+- Clay+
+- Clay-
 - Size
 - Strength
 - Reset
@@ -19,106 +18,103 @@ Runtime stays intentionally tiny:
 - two-finger orbit
 - pinch zoom
 
-No Smooth, Grab, masks, layers, import/export, DynTopo, remesh UI or character
-tooling is in this milestone.
+No Smooth, Grab, masks, layers, import/export, adaptive detail, character tools or new brushes are added here.
 
-## Why AVS
+## Surface Truth contract
 
-The old Core 0.3.x architecture could keep a triangle mesh structurally valid,
-but a sculpt brush still had to fight edge stretch, collapse quality, flips and
-topology saturation.
+The field convention is fixed:
 
-AVS moves that responsibility out of every brush.
+- negative SDF = inside
+- positive SDF = outside
+- zero crossing = visible surface
 
-The source-of-truth pipeline is:
+The renderer contract is fixed:
 
-    touch/ray
-      -> sparse signed-distance bricks
-      -> local CSG field edit
-      -> mark neighboring bricks dirty
-      -> conforming volume extractor rebuilds only dirty surface chunks
-      -> OpenGL renders disposable chunks
+- generated faces point toward increasing SDF (outside)
+- front face = CCW
+- cull face = BACK
 
-Clay never directly moves a mesh vertex.
+`SculptRenderer` explicitly sets that OpenGL state. VSS renders its screenshots using the same front/back visibility rule, so a winding regression appears as a hole in CI evidence instead of being hidden by a two-sided debug renderer.
+
+## Extractor
+
+`AvsSurfaceCache` still uses a globally repeated six-tetrahedra Freudenthal decomposition of every grid cube.
+
+AVS 0.1.1 changes the surface conversion rules substantially:
+
+1. **Winding no longer depends on shading normals.**
+   Each tetrahedron computes the exact gradient of its linear scalar interpolant. Because AVS uses positive-outside SDF values, that gradient is the deterministic outward direction used to orient every emitted triangle.
+
+2. **Chunk seam interpolation is canonical.**
+   Every crossed lattice edge is ordered by global lattice coordinates before interpolation. Neighboring chunks therefore perform the same floating-point expression on the same endpoint values and produce bit-identical seam positions.
+
+3. **Tiny legal triangles are retained.**
+   A surface passing extremely close to a quantized lattice sample can legitimately create microscopic triangles. Dropping them created real pinholes. Only truly zero/invalid-area faces are rejected now.
+
+4. **Normals cannot decide topology.**
+   Triangle winding comes only from field truth. Shading normals use the SDF gradient when it agrees with the oriented geometric surface and fall back to geometric normals near CSG creases.
+
+The render mesh remains disposable. It can be thrown away and reconstructed from `AvsVolume` without losing the sculpt.
+
+## Surface Truth VSS
+
+Every Android build is hard-gated by `vssVerify`.
+
+The VSS now tests both **field truth** and **surface truth**. Surface verification welds chunk boundaries conceptually and checks:
+
+- boundary edges = 0
+- non-manifold edges = 0
+- shared directed edges have opposite orientation
+- duplicate triangles = 0
+- degenerate triangles = 0
+- seam positions are bit-identical where the same surface vertex is shared
+- signed surface volume has the expected orientation in known closed-solid tests
+- SDF inside/outside sampling agrees with face orientation within the tetra-vs-trilinear approximation tolerance
+- shading normals do not broadly oppose their triangles
+
+The verifier also contains negative controls: it intentionally flips one triangle and removes one triangle from a known-good sphere and must detect both the winding error and the crack. A broken verifier therefore cannot silently approve itself.
+
+### Stress scenarios
+
+VSS 0.1.1 runs:
+
+- baseline sphere surface truth
+- verifier negative controls
+- CSG exactly on/near brick planes and corners
+- a resolvable thin feature crossing many bricks
+- 240 repeated Clay+ operations with culling-on checkpoints
+- Clay- carve smoke test
+- 2,000 hostile mixed CSG operations with progressive surface audits
+- incremental dirty-chunk extraction vs a fresh full rebuild (surface SHA-256 must match)
+- bit-exact snapshot restore for both field and extracted surface hashes
+- deterministic field + surface replay
+- dirty-chunk locality
+- repeated destroy/rebuild-equivalent cache construction
+- raycast and full-extraction performance smoke tests
+
+## Evidence
+
+VSS emits:
+
+- `dump.json` with schema `cabrush-avs-surface-truth-dump-v2`
+- `dump.txt`
+- culling-on screenshots for baseline, seam torture, thin features, Clay+, Clay-, and hostile CSG
+- `99-contact-sheet.png`
+
+The dump records field hashes, surface hashes, boundary/non-manifold/directed-edge counts, duplicate/degenerate counts, seam mismatches, orientation diagnostics, signed volume, memory and timing telemetry.
 
 ## Sparse field
 
-`AvsVolume` uses:
+`AvsVolume` remains AVS sculpt truth:
 
 - 8x8x8 samples per brick
-- signed 16-bit fixed-point distance samples
-- one globally-owned lattice sample per coordinate
-- positive background outside allocated bricks
-- negative values inside the sculpt
-- 0 as the surface
-- deterministic primitive-key lookup
-- hard 12,000-brick guard for the 32-bit Android prototype
+- 16-bit signed fixed-point SDF samples
+- 512 samples = exactly 1 KiB raw SDF payload per brick
+- `VOXEL_SIZE = 0.045`
+- missing brick = positive/outside background
+- hard 12,000-brick guard for the 32-bit prototype
 
-At 512 samples x 2 bytes, raw SDF payload is exactly 1 KiB per allocated brick
-before small Java/lookup metadata.
-
-The initial sphere allocates only a compact brick region around its volume.
-Clay+ allocates new bricks as the shape grows. Empty world space costs nothing.
-
-## Clay
-
-Clay is volume CSG:
-
-- Clay+ unions a sphere-shaped field into the sculpt
-- Clay- subtracts it
-
-A touch ray intersects the SDF itself, not the generated triangles. The brush
-sphere is positioned so only a controlled depth overlaps the current surface.
-Repeated strokes can therefore keep extending the volume instead of exhausting
-an original triangle edge budget.
-
-## Surface cache
-
-`AvsSurfaceCache` uses a globally conforming six-tetrahedra split per grid cell and Marching Tetrahedra.
-
-Each dirty 8-cell brick gets a one-cell ghost apron while meshing. Adjacent
-chunks read identical global SDF samples, so their boundary vertices are
-computed from the same data.
-
-Each render chunk has its own local 16-bit indices and is far below 65,535
-vertices. The renderer tracks chunk revisions by brick ID, so unchanged chunks
-do not need to be regenerated after a local brush edit.
-
-The render mesh can be deleted and regenerated without losing the sculpt.
-
-## AVS VSS
-
-Every Android build is gated by the dependency-free AVS verifier.
-
-The test suite checks:
-
-- initial SDF sign and sphere raycast
-- generated closed surface after weld-by-position verification
-- repeated Clay+ monotonic growth without fixed-topology saturation
-- Clay- volume removal
-- thousands of deterministic mixed CSG stamps
-- sparse brick budget
-- dirty-chunk locality
-- snapshot bit-exact restoration
-- deterministic field replay/hash
-- raycast correctness after heavy edits
-- surface-chunk seam closure after heavy edits
-- extraction/raycast timing telemetry
-- raw field/render-cache memory telemetry
-- progression screenshots and contact sheet
-
-Artifacts:
-
-- `dump.json` (`cabrush-avs-dump-v1`)
-- `dump.txt`
-- baseline screenshot
-- Clay+ growth checkpoints
-- Clay- result
-- mixed CSG stress result
-- contact sheet
-
-`app:preBuild` depends on `vssVerify`, so an APK is not packaged when AVS
-verification fails.
+Clay+ and Clay- modify the field with CSG. They never move triangle vertices.
 
 ## Build
 
@@ -142,27 +138,21 @@ Artifacts:
 - APK: `app/build/outputs/apk/debug/app-debug.apk`
 - VSS: `app/build/vss/report/`
 
+GitHub Actions uploads VSS evidence even when verification fails. The APK artifact is uploaded only when VSS and Android compilation succeed.
+
 ## Android / ABI
 
-AVS 0.1 is still Java + Android SDK + OpenGL ES 3.0 and contains no native
-`.so` libraries, so the current core has no ABI split.
+AVS 0.1.1 is still Java + Android SDK + OpenGL ES 3.0 with no native `.so` libraries, so there is no native ABI split yet.
 
 Any future native acceleration layer must preserve both:
 
 - `armeabi-v7a`
 - `arm64-v8a`
 
-## What comes after this proof
+## Next gate
 
-AVS 0.1 is deliberately a single-resolution sparse field. It proves the new
-source-of-truth model first.
+Do not tune Clay or add another sculpt feature until:
 
-Only after the real 32-bit phone and CI evidence are clean should we add:
-
-1. adaptive brick resolution / detail levels
-2. Smooth as an SDF filter
-3. Grab as local field warping
-4. higher-quality detail extraction / sharp-feature strategy
-5. displacement/detail tiles for micro detail
-
-That keeps CABrush's core simple: sculpt the field, regenerate the surface.
+1. AVS 0.1.1 is green in GitHub Actions.
+2. The uploaded Surface Truth screenshots/dump are inspected.
+3. The same long extrusion and abusive add/subtract sessions render solid on the real 32-bit Android device with back-face culling enabled.

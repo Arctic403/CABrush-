@@ -10,8 +10,8 @@ android {
         applicationId 'com.fallpoint.pocketsculpt'
         minSdk 24
         targetSdk 35
-        versionCode 9
-        versionName '0.4.0'
+        versionCode 10
+        versionName '0.4.1'
     }
 
     buildTypes {
@@ -27,9 +27,10 @@ android {
     }
 }
 
-// AVS VSS compiles the exact dependency-free volume + surface core used by Android.
-// preBuild is blocked until sparse-field, CSG, raycast, seam, determinism,
-// snapshot and stress verification has emitted its dump/screenshots and passed.
+// AVS 0.1.1 Surface Truth VSS compiles the exact dependency-free volume +
+// surface conversion code used by Android. preBuild is blocked until field
+// truth, winding, seams, deterministic extraction, cache rebuild equivalence,
+// snapshots, stress and Android-equivalent culling screenshots all pass.
 def vssClassesDir = layout.buildDirectory.dir('vss/classes')
 def vssReportDir = layout.buildDirectory.dir('vss/report')
 

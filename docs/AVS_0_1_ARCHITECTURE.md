@@ -1,136 +1,132 @@
-# CABrush AVS 0.1 Architecture
-
-## Decision
-
-Core 0.3.x is retired as the runtime sculpt architecture.
-
-Its half-edge/BVH/transaction work remains useful research history, but AVS
-does not keep a mutable triangle mesh as source of truth.
+# CABrush AVS 0.1.1 Architecture — Surface Truth
 
 ## Source of truth
 
-`AvsVolume`
+The sculpt is `AvsVolume`, a sparse signed-distance field. Render triangles are never user data.
 
-A sparse regular-grid signed-distance field.
+Field convention:
 
-- brick payload: 8x8x8 signed 16-bit samples
-- voxel size: 0.045 world units in AVS 0.1
-- fixed-point scale: 8192 quantization units per voxel
-- negative: inside
-- positive: outside
-- zero crossing: visible sculpt surface
-- missing brick: constant positive background
-- hard brick budget: 12,000
+- `SDF < 0`: inside
+- `SDF > 0`: outside
+- zero crossing: surface
 
-This first milestone stores full bricks around occupied volume plus a working
-distance band. It intentionally avoids an octree and multiresolution logic
-until the simpler model is proven on the target phone.
+This convention is also the orientation contract: **outward means increasing scalar value**.
 
-## Field operations
+## Why Surface Truth exists
 
-Sphere SDF:
+AVS 0.1 proved that volume sculpting removes the fixed-topology growth wall, but the first Android test exposed a separate cache failure: a field could remain usable while generated triangles had incorrect winding and disappeared under back-face culling.
 
-    length(p - center) - radius
+That failure is deliberately isolated here. Clay behavior is not the focus of 0.1.1.
 
-Clay+:
+## Conforming cell decomposition
 
-    field = min(field, brushSdf)
+Each regular grid cube is decomposed into the same six tetrahedra around corner diagonal `0 -> 7`.
 
-Clay-:
+Using the same translated decomposition everywhere ensures neighboring cubes use the same diagonal on their shared face. Marching Tetrahedra therefore avoids the ambiguous face configurations of classic Marching Cubes and produces a deterministic local topology for the sampled field.
 
-    field = max(field, -brushSdf)
+Each brick owns cells whose minimum lattice corner lies inside that brick. Cell corners at local coordinate 8 read the neighboring global sample. No cell is duplicated across chunks.
 
-Those are direct volume operations. No edge split/collapse/flip is required.
+## Canonical edge intersections
 
-Brush strength controls overlap depth of the brush volume rather than scaling
-triangle displacement.
+A surface vertex lives on an edge whose scalar endpoints have opposite signs.
 
-## Sparse allocation
+Before interpolation, AVS orders the two **global lattice coordinates** lexicographically. This means both chunks adjacent to the same physical edge evaluate:
 
-The initial sphere allocates a compact brick region around the primitive.
+    t = valueA / (valueA - valueB)
+    p = A + (B - A) * t
 
-A CSG edit allocates the brush working region plus halo before writing samples.
-Only changed bricks and their neighbors become dirty.
+with the same A/B order and the same floating-point operation sequence.
 
-AVS 0.1 does not prune bricks yet. Allocation is monotonic during a session,
-which makes correctness and deterministic snapshots simpler for the proof.
+The goal is stronger than "close enough after welding": shared seam positions should be bit-identical.
 
-## Picking
+## Deterministic triangle winding
 
-Picking reads the implicit field directly.
+Shading normals are not geometry truth.
 
-The CPU raycast:
+For every tetrahedron AVS reconstructs the gradient of the tetrahedron's exact linear scalar interpolant. Given tetrahedron point `p0` and edge vectors `e1/e2/e3`, the gradient `g` satisfies:
 
-1. clips the ray to allocated brick bounds
-2. samples the field at a sub-voxel step
-3. finds positive -> negative sign transition
-4. binary-refines the crossing
-5. estimates the surface normal from central SDF differences
+    dot(g, e1) = f1 - f0
+    dot(g, e2) = f2 - f0
+    dot(g, e3) = f3 - f0
 
-It does not depend on the render mesh.
+The implementation solves this with reciprocal-basis cross products.
 
-## Surface cache
+Because AVS defines positive SDF as outside, `g` points toward the outside half-space. Every generated triangle is swapped when necessary so:
 
-`AvsSurfaceCache`
+    dot(faceNormal, g) > 0
 
-AVS 0.1 uses Marching Tetrahedra over a Freudenthal six-tetrahedra split of every grid cube. The same translated split is used everywhere, so neighboring cubes agree on shared face diagonals and avoid the ambiguous cube cases that complicated the first Surface Nets experiment.
+This handles the paired Marching-Tetrahedra sign cases explicitly and does not depend on a noisy central-difference normal after repeated CSG.
 
-Each brick owns its 8x8x8 cells and samples a one-point positive boundary from the neighboring brick when needed. Intersection vertices are deduplicated inside each chunk and every chunk uses local 16-bit indices. Generated triangles are cache only.
+## Near-zero samples and tiny triangles
 
-## Rendering
+AVS quantization intentionally prevents exact zero lattice samples. A surface can still pass extremely close to a lattice point and produce very small but topologically necessary triangles.
 
-`SculptRenderer`
+Surface Truth testing found that discarding those triangles by an aggressive area threshold creates pinholes. The extractor therefore rejects only truly zero/non-finite faces and preserves tiny legal closure triangles.
 
-The renderer stores GPU/client buffers by stable brick ID and surface-chunk
-revision.
+Future quality extraction may regularize these areas, but it must do so without breaking topology.
 
-A brush edit can rebuild several nearby chunks while untouched chunk buffers
-are reused.
+## Shading normals
 
-EGL loss is harmless to the sculpt because all GPU state can be regenerated
-from `AvsVolume`.
+After topology and winding are final, the chunk accumulates geometric face normals. At each vertex it also samples the SDF gradient.
 
-## Snapshots
+If the SDF gradient agrees with the oriented geometric normal, they are blended for smoother cross-chunk shading. Near sharp CSG transitions where the sampled gradient disagrees, the geometric normal wins.
 
-`AvsSnapshot`
+Normals are presentation data only. They never flip a triangle.
 
-A deterministic deep copy of brick coordinates + quantized field samples.
+## Android raster contract
 
-The snapshot format is intentionally simple. It supports:
+The runtime explicitly uses:
 
-- reset
-- VSS deterministic hashes
-- future undo foundation
-- future crash-recovery foundation
+    glFrontFace(GL_CCW)
+    glCullFace(GL_BACK)
+    glEnable(GL_CULL_FACE)
 
-## Verification philosophy
+VSS screenshots use an equivalent CCW/front-facing camera-space test. This makes CI evidence reproduce the class of failure seen on Android rather than hiding it with two-sided rendering.
 
-VSS tests the sculpt representation, not mutable triangle survival.
+## Surface audit
 
-Mandatory truths:
+`tools/AvsSurfaceAudit.java` conceptually welds duplicate chunk vertices and validates the output surface.
 
-- field samples remain finite/quantized
-- inside/outside signs are correct
-- repeated addition keeps growing
-- subtraction removes volume
-- field replay is deterministic
-- local changes stay local
-- surface extraction remains closed after welding matching chunk vertices
-- raycast still finds the implicit surface after stress
-- brick and surface-cache memory stay inside explicit budgets
+For each surface it measures:
 
-The generated mesh is allowed to change completely between surface-cache
-versions because it is not user data.
+- boundary edge count
+- non-manifold edge count
+- same-direction shared edges
+- duplicate triangles
+- degenerate triangles
+- exact seam-position mismatches
+- signed volume
+- SDF-side orientation agreement
+- shading-normal agreement
+- deterministic surface SHA-256
 
-## Future adaptive detail
+For a closed consistently oriented surface every shared undirected edge must occur exactly twice and the two directed occurrences must cancel.
 
-AVS 0.1 is intentionally single-resolution.
+## VSS negative controls
 
-The planned path is hierarchical:
+The verification system mutates a known-good baseline surface in two controlled ways:
 
-- coarse bricks for silhouette/body mass
-- finer bricks only near high-detail regions
-- surface detail/displacement tiles for micro detail
+1. swap two indices of one triangle
+2. remove one triangle
 
-That later system must preserve a single unambiguous field evaluation across
-resolution boundaries before it is allowed into the runtime.
+The first must trigger winding/orientation evidence. The second must produce boundary edges. This verifies the verifier itself before trusting a green build.
+
+## Incremental cache equivalence
+
+A local sculpt edit is first extracted using the normal dirty-brick path. Then the entire surface cache is discarded and regenerated from the same `AvsVolume`.
+
+The canonical surface hashes must match exactly.
+
+This proves that dirty-cache history cannot change the rendered geometry.
+
+## What 0.1.1 intentionally does not solve
+
+- production Clay feel
+- adaptive/multiresolution bricks
+- voxel pruning
+- Smooth/Grab
+- sharp-feature preservation beyond the current sampled field
+- micro-detail/displacement tiles
+- high-end mesh export topology
+
+Those remain blocked until Surface Truth passes CI and the real 32-bit Android test.
