@@ -16,10 +16,6 @@ public class MainActivity extends Activity {
     private SculptSurfaceView sculptView;
     private Button addButton;
     private Button subtractButton;
-    private Button smoothButton;
-    private Button symmetryButton;
-    private Button grabButton;
-    private Button dynTopoButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -48,30 +44,26 @@ public class MainActivity extends Activity {
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(dp(12), dp(8), dp(12), dp(8));
-        bar.setBackgroundResource(com.fallpoint.pocketsculpt.R.drawable.panel_bg);
+        bar.setBackgroundResource(R.drawable.panel_bg);
 
         TextView title = new TextView(this);
-        title.setText("PocketSculpt  V1.4");
+        title.setText("CABrush Core 0.2");
         title.setTextColor(Color.WHITE);
         title.setTextSize(17f);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
-        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(0, dp(44), 1f);
         title.setGravity(Gravity.CENTER_VERTICAL);
-        bar.addView(title, titleParams);
+        bar.addView(title, new LinearLayout.LayoutParams(0, dp(44), 1f));
 
-        bar.addView(actionButton("Undo", v -> sculptView.undo()));
-        bar.addView(spacer(6));
-        bar.addView(actionButton("Redo", v -> sculptView.redo()));
-        bar.addView(spacer(6));
-        bar.addView(actionButton("Reset", v -> sculptView.resetMesh()));
+        Button reset = actionButton("Reset", v -> sculptView.resetMesh());
+        bar.addView(reset);
         return bar;
     }
 
     private View buildBottomPanel() {
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(10), dp(10), dp(10), dp(10));
-        panel.setBackgroundResource(com.fallpoint.pocketsculpt.R.drawable.panel_bg);
+        panel.setPadding(dp(10), dp(10), dp(10), dp(8));
+        panel.setBackgroundResource(R.drawable.panel_bg);
 
         LinearLayout tools = new LinearLayout(this);
         tools.setOrientation(LinearLayout.HORIZONTAL);
@@ -79,58 +71,30 @@ public class MainActivity extends Activity {
 
         addButton = toolButton("Clay +", v -> selectMode(BrushMode.ADD));
         subtractButton = toolButton("Clay -", v -> selectMode(BrushMode.SUBTRACT));
-        smoothButton = toolButton("Smooth", v -> selectMode(BrushMode.SMOOTH));
-        grabButton = toolButton("Grab", v -> selectMode(BrushMode.GRAB));
-        symmetryButton = toolButton("Sym X", v -> toggleSymmetry());
 
         tools.addView(addButton, toolParams());
-        tools.addView(spacer(5));
+        tools.addView(spacer(8));
         tools.addView(subtractButton, toolParams());
-        tools.addView(spacer(5));
-        tools.addView(smoothButton, toolParams());
-        tools.addView(spacer(5));
-        tools.addView(grabButton, toolParams());
-        tools.addView(spacer(5));
-        tools.addView(symmetryButton, toolParams());
         panel.addView(tools);
 
-        LinearLayout topology = new LinearLayout(this);
-        topology.setOrientation(LinearLayout.HORIZONTAL);
-        topology.setGravity(Gravity.CENTER_VERTICAL);
-        dynTopoButton = toolButton("DynTopo", v -> toggleDynamicTopology());
-        styleTool(dynTopoButton, true);
-        Button remeshButton = toolButton("Remesh", v -> sculptView.remeshNow());
-        Button sphereButton = toolButton("Sphere", v -> sculptView.newSphere());
-        Button humanButton = toolButton("Human", v -> sculptView.newHuman());
-        topology.addView(dynTopoButton, toolParams());
-        topology.addView(spacer(5));
-        topology.addView(remeshButton, toolParams());
-        topology.addView(spacer(5));
-        topology.addView(sphereButton, toolParams());
-        topology.addView(spacer(5));
-        topology.addView(humanButton, toolParams());
-        panel.addView(topology);
+        panel.addView(sliderRow(
+                "Size", 1, 100, 38,
+                value -> sculptView.setBrushRadius(0.05f + value * 0.0055f)
+        ));
 
-        LinearLayout sizeRow = sliderRow("Size", 1, 100, 36, value -> sculptView.setBrushRadius(0.035f + value * 0.0065f));
-        panel.addView(sizeRow);
-
-        LinearLayout strengthRow = sliderRow("Strength", 1, 100, 28, value -> sculptView.setBrushStrength(0.0015f + value * 0.00070f));
-        panel.addView(strengthRow);
-
-        LinearLayout detailRow = sliderRow("Detail", 1, 100, 56, value -> {
-            // Higher UI value = finer topology (smaller target edge ratio).
-            float ratio = 0.40f - (value / 100f) * 0.28f;
-            sculptView.setTopologyDetail(ratio);
-        });
-        panel.addView(detailRow);
+        panel.addView(sliderRow(
+                "Strength", 1, 100, 30,
+                value -> sculptView.setBrushStrength(0.001f + value * 0.00045f)
+        ));
 
         TextView help = new TextView(this);
-        help.setText("DynTopo adds/removes detail  •  Remesh uses current Size/Detail");
+        help.setText("1 finger sculpt  •  2 fingers orbit / pinch zoom");
         help.setTextColor(Color.rgb(185, 192, 199));
-        help.setTextSize(11f);
+        help.setTextSize(12f);
         help.setGravity(Gravity.CENTER);
-        help.setPadding(0, dp(2), 0, 0);
-        panel.addView(help, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(24)));
+        panel.addView(help, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(26)
+        ));
 
         return panel;
     }
@@ -139,14 +103,13 @@ public class MainActivity extends Activity {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(4), 0, 0);
 
         TextView text = new TextView(this);
         text.setText(label);
         text.setTextColor(Color.WHITE);
         text.setTextSize(13f);
-        row.addView(text, new LinearLayout.LayoutParams(dp(66), dp(36)));
         text.setGravity(Gravity.CENTER_VERTICAL);
+        row.addView(text, new LinearLayout.LayoutParams(dp(72), dp(36)));
 
         SeekBar slider = new SeekBar(this);
         slider.setMax(max - min);
@@ -167,30 +130,16 @@ public class MainActivity extends Activity {
         sculptView.setBrushMode(mode);
         styleTool(addButton, mode == BrushMode.ADD);
         styleTool(subtractButton, mode == BrushMode.SUBTRACT);
-        styleTool(smoothButton, mode == BrushMode.SMOOTH);
-        styleTool(grabButton, mode == BrushMode.GRAB);
-    }
-
-    private void toggleSymmetry() {
-        boolean enabled = sculptView.toggleSymmetry();
-        styleTool(symmetryButton, enabled);
-    }
-
-    private void toggleDynamicTopology() {
-        boolean enabled = sculptView.toggleDynamicTopology();
-        styleTool(dynTopoButton, enabled);
     }
 
     private void styleTool(Button button, boolean active) {
-        if (button == null) return;
         button.setBackgroundResource(active ? R.drawable.button_active_bg : R.drawable.button_bg);
         button.setTextColor(active ? Color.rgb(14, 17, 20) : Color.WHITE);
     }
 
     private Button toolButton(String text, View.OnClickListener listener) {
         Button button = actionButton(text, listener);
-        button.setTextSize(11f);
-        button.setAllCaps(false);
+        button.setTextSize(13f);
         return button;
     }
 
@@ -204,28 +153,28 @@ public class MainActivity extends Activity {
         button.setMinimumWidth(0);
         button.setMinHeight(0);
         button.setMinimumHeight(0);
-        button.setPadding(dp(10), 0, dp(10), 0);
+        button.setPadding(dp(12), 0, dp(12), 0);
         button.setBackgroundResource(R.drawable.button_bg);
         button.setOnClickListener(listener);
-        button.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)));
+        button.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)
+        ));
         return button;
     }
 
-    private View spacer(int dp) {
+    private View spacer(int widthDp) {
         View view = new View(this);
-        view.setLayoutParams(new LinearLayout.LayoutParams(dp(dp), 1));
+        view.setLayoutParams(new LinearLayout.LayoutParams(dp(widthDp), 1));
         return view;
     }
 
     private LinearLayout.LayoutParams toolParams() {
-        return new LinearLayout.LayoutParams(0, dp(42), 1f);
+        return new LinearLayout.LayoutParams(0, dp(44), 1f);
     }
 
     private FrameLayout.LayoutParams topBarParams() {
         FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(62),
-                Gravity.TOP
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(62), Gravity.TOP
         );
         p.setMargins(dp(10), dp(10), dp(10), 0);
         return p;
@@ -233,9 +182,7 @@ public class MainActivity extends Activity {
 
     private FrameLayout.LayoutParams bottomPanelParams() {
         FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(286),
-                Gravity.BOTTOM
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(174), Gravity.BOTTOM
         );
         p.setMargins(dp(10), 0, dp(10), dp(10));
         return p;
@@ -255,5 +202,7 @@ public class MainActivity extends Activity {
         super.onPause();
     }
 
-    private interface IntChange { void onChange(int value); }
+    private interface IntChange {
+        void onChange(int value);
+    }
 }
