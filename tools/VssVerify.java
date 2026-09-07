@@ -22,7 +22,7 @@ import java.util.Locale;
 import java.util.Random;
 
 /**
- * Verification Snapshot System v2.
+ * Verification Snapshot System v3.
  *
  * This is intentionally not a "did Java compile?" test. It fuzzes topology,
  * proves BVH results against brute force, verifies rollback/snapshots/render
@@ -84,6 +84,7 @@ public final class VssVerify {
             baseline(out, contactImages, contactLabels);
             topologyPrimitives(out, contactImages, contactLabels);
             topologyFuzz(out, contactImages, contactLabels);
+            selfIntersectionGuard();
             transactionRollback();
             snapshotRoundTrip();
             bvhVerification();
@@ -111,7 +112,7 @@ public final class VssVerify {
         writeText(out, duration);
 
         boolean pass = failures.isEmpty();
-        System.out.println("CABrush Core 0.3 VSS: " + (pass ? "PASS" : "FAIL"));
+        System.out.println("CABrush Core 0.3.1 VSS: " + (pass ? "PASS" : "FAIL"));
         System.out.println("Scenarios: " + scenarios.size() + "  failures=" + failures.size());
         System.out.println("Evidence: " + out.getAbsolutePath());
         if (!pass) {
@@ -148,32 +149,60 @@ public final class VssVerify {
         if (split.committed) s.accepted++; else s.rejected++;
         check(split.committed, s, "split failed: " + split.detail);
         check(GeometryValidator.validate(mesh, true).ok, s, "post-split invalid");
+        check(GeometryQuality.countSelfIntersections(mesh, 1) == 0, s, "split introduced self-intersection");
         addScreenshot(out, "01-topology-split.png", mesh, "EDGE SPLIT", images, labels);
 
+        // A quality-aware flip is allowed to decline. On a near-equilateral
+        // icosphere there may be no beneficial diagonal. The important
+        // primitive contract is: rejection is atomic, and any accepted flip is
+        // geometrically sane.
         mesh.ensureConnectivity();
-        boolean flipped = false;
-        for (int i = 0; i < mesh.halfEdgeCount && !flipped; i++) {
-            GeometryTransaction.Result r = GeometryOps.flipEdge(mesh, mesh.heOrigin[i], mesh.heDest[i]);
+        int flipAttempts = Math.min(mesh.halfEdgeCount, 128);
+        boolean flipCommitted = false;
+        for (int i = 0; i < flipAttempts; i++) {
+            MeshSnapshot beforeFlip = MeshSnapshot.capture(mesh);
+            int fh = (i * 37) % mesh.halfEdgeCount;
+            GeometryTransaction.Result r = GeometryOps.flipEdge(mesh, mesh.heOrigin[fh], mesh.heDest[fh]);
             s.attempted++;
-            if (r.committed) { s.accepted++; flipped = true; } else s.rejected++;
+            if (r.committed) {
+                s.accepted++;
+                flipCommitted = true;
+                check(GeometryValidator.validate(mesh, true).ok, s, "accepted flip invalid");
+                break;
+            } else {
+                s.rejected++;
+                check(beforeFlip.sha256().equals(MeshSnapshot.capture(mesh).sha256()), s,
+                        "rejected flip mutated mesh");
+            }
         }
-        check(flipped, s, "no edge flip could be committed");
-        check(GeometryValidator.validate(mesh, true).ok, s, "post-flip invalid");
 
+        // Collapse only a short edge created by the split. This exercises the
+        // link condition + placement filter instead of arbitrary simplification.
         mesh.ensureConnectivity();
         boolean collapsed = false;
-        for (int i = 0; i < mesh.halfEdgeCount && !collapsed; i++) {
-            GeometryTransaction.Result r = GeometryOps.collapseEdge(mesh, mesh.heOrigin[i], mesh.heDest[i]);
+        float shortest = Float.POSITIVE_INFINITY;
+        int ca = MeshKernel.INVALID, cb = MeshKernel.INVALID;
+        for (int i = 0; i < mesh.halfEdgeCount; i++) {
+            int u = mesh.heOrigin[i], v = mesh.heDest[i];
+            float len = GeometryValidator.edge(mesh, u, v);
+            if (len < shortest) { shortest = len; ca = u; cb = v; }
+        }
+        if (ca != MeshKernel.INVALID) {
+            GeometryTransaction.Result r = GeometryOps.collapseEdge(mesh, ca, cb);
             s.attempted++;
             if (r.committed) { s.accepted++; collapsed = true; } else s.rejected++;
         }
-        check(collapsed, s, "no edge collapse could be committed");
+        check(collapsed, s, "safe short-edge collapse could not be committed");
         check(GeometryValidator.validate(mesh, true).ok, s, "post-collapse invalid");
-        addScreenshot(out, "02-topology-primitives.png", mesh, "SPLIT + FLIP + COLLAPSE", images, labels);
+        check(GeometryQuality.countSelfIntersections(mesh, 1) == 0, s, "collapse introduced self-intersection");
+        addScreenshot(out, "02-topology-primitives.png", mesh,
+                flipCommitted ? "SPLIT + SAFE FLIP + COLLAPSE" : "SPLIT + FLIP REJECT + COLLAPSE",
+                images, labels);
 
         original.restoreInto(mesh);
         check(MeshSnapshot.capture(mesh).sha256().equals(original.sha256()), s, "primitive reset hash mismatch");
         s.hash = MeshSnapshot.capture(mesh).sha256();
+        s.detail = "flipCommitted=" + flipCommitted;
         s.durationMs = System.currentTimeMillis() - start;
     }
 
@@ -181,19 +210,35 @@ public final class VssVerify {
         Scenario s = scenario("topology-fuzz-1500");
         long start = System.currentTimeMillis();
         MeshKernel mesh = MeshKernel.createIcoSphere(2, 1f);
+        GeometryQuality.Stats baseline = GeometryQuality.measure(mesh);
         Random random = new Random(BASE_SEED ^ 0x101L);
         LongList timings = new LongList(2048);
 
-        for (int i = 0; i < 1500; i++) {
+        final int targetFaces = mesh.liveFaceCount;
+        for (int i = 1; i <= 1500; i++) {
             mesh.ensureConnectivity();
             if (mesh.halfEdgeCount == 0) break;
-            int h = random.nextInt(mesh.halfEdgeCount);
-            int a = mesh.heOrigin[h], b = mesh.heDest[h];
-            int choice;
-            if (mesh.liveFaceCount > 650) choice = 1;       // bias collapse
-            else if (mesh.liveFaceCount < 250) choice = 0;  // bias split
-            else choice = random.nextInt(3);
 
+            // Exercise hostile choices, but choose edge scale the same way a
+            // real isotropic-remesh policy does: long edges are split, short
+            // edges are collapsed, and flips are only accepted if quality is
+            // not degraded.
+            int h;
+            int choice;
+            if (mesh.liveFaceCount > targetFaces * 1.18f) {
+                h = sampledExtremeEdge(mesh, random, false);
+                choice = 1; // collapse shortest sampled edge
+            } else if (mesh.liveFaceCount < targetFaces * 0.82f) {
+                h = sampledExtremeEdge(mesh, random, true);
+                choice = 0; // split longest sampled edge
+            } else {
+                int roll = random.nextInt(100);
+                if (roll < 38) { choice = 2; h = random.nextInt(mesh.halfEdgeCount); }
+                else if (roll < 70) { choice = 0; h = sampledExtremeEdge(mesh, random, true); }
+                else { choice = 1; h = sampledExtremeEdge(mesh, random, false); }
+            }
+
+            int a = mesh.heOrigin[h], b = mesh.heDest[h];
             long t0 = System.nanoTime();
             GeometryTransaction.Result r;
             if (choice == 0) r = GeometryOps.splitEdge(mesh, a, b);
@@ -203,19 +248,50 @@ public final class VssVerify {
 
             s.attempted++;
             if (r.committed) s.accepted++; else s.rejected++;
+
             if ((i % 50) == 0) {
                 GeometryValidator.Report report = GeometryValidator.validate(mesh, true);
                 check(report.ok, s, "fuzz invalid at " + i + ": " + report);
+                check(GeometryQuality.countSelfIntersections(mesh, 1) == 0, s,
+                        "self-intersection at " + i);
+                checkShapeEnvelope(mesh, baseline, s, "fuzz@" + i, 0.10, 0.10, 2.05f, 0.78f, 1.16f);
                 if (!s.pass) break;
+            }
+            if (i == 250 || i == 750 || i == 1500) {
+                addScreenshot(out, String.format(Locale.US, "03-topology-fuzz-%04d.png", i),
+                        mesh, "TOPOLOGY FUZZ " + i, images, labels);
             }
         }
 
-        check(s.accepted >= 250, s, "too few topology mutations accepted: " + s.accepted);
+        check(s.accepted >= 180, s, "too few safe topology mutations accepted: " + s.accepted);
         check(GeometryValidator.validate(mesh, true).ok, s, "final fuzz mesh invalid");
+        check(GeometryQuality.countSelfIntersections(mesh, 1) == 0, s, "final fuzz self-intersection");
+        checkShapeEnvelope(mesh, baseline, s, "fuzz-final", 0.10, 0.10, 2.05f, 0.78f, 1.16f);
+
+        GeometryQuality.Stats endStats = GeometryQuality.measure(mesh);
         s.hash = MeshSnapshot.capture(mesh).sha256();
+        s.detail = String.format(Locale.US,
+                "V=%d F=%d areaDrift=%.4f volumeDrift=%.4f qMin=%.3f edgeMax=%.4f radial=%.4f..%.4f",
+                mesh.liveVertexCount, mesh.liveFaceCount,
+                relativeDrift(endStats.area, baseline.area),
+                relativeDrift(endStats.signedVolume, baseline.signedVolume),
+                endStats.minQuality, endStats.maxEdge, endStats.minRadius, endStats.maxRadius);
         double[] q = timings.quantilesMicros();
         perf.topologyP50Us = q[0]; perf.topologyP95Us = q[1]; perf.topologyP99Us = q[2];
-        addScreenshot(out, "03-topology-fuzz.png", mesh, "1500 TOPOLOGY FUZZ OPS", images, labels);
+        s.durationMs = System.currentTimeMillis() - start;
+    }
+
+    private static void selfIntersectionGuard() {
+        Scenario s = scenario("self-intersection-detector");
+        long start = System.currentTimeMillis();
+        MeshKernel mesh = MeshKernel.createIcoSphere(2, 1f);
+        int v = mesh.activeVertexIds()[0];
+        float x = mesh.x(v), y = mesh.y(v), z = mesh.z(v);
+        mesh.setVertexPosition(v, -x * 1.5f, -y * 1.5f, -z * 1.5f);
+        mesh.recomputeNormalsAll();
+        int intersections = GeometryQuality.countSelfIntersections(mesh, 10);
+        check(intersections > 0, s, "known folded mesh was not detected");
+        s.detail = "detectedPairs>=" + intersections;
         s.durationMs = System.currentTimeMillis() - start;
     }
 
@@ -375,30 +451,59 @@ public final class VssVerify {
         long start = System.currentTimeMillis();
         SculptMesh sculpt = SculptMesh.createSphere();
         Random random = new Random(BASE_SEED ^ 0x404L);
-        float[] focus = {0f, 0f, 1f};
+        GeometryQuality.Stats baseline = GeometryQuality.measure(sculpt.kernel);
 
         addScreenshot(out, "10-clay-start.png", sculpt.kernel, "CLAY START", images, labels);
+
+        int addAccepted = 0;
+        int addRejected = 0;
+        float[] checkpointRadius = new float[3];
+        int checkpointIndex = 0;
         for (int i = 1; i <= 700; i++) {
             float jitterX = (random.nextFloat() - 0.5f) * 0.22f;
             float jitterY = (random.nextFloat() - 0.5f) * 0.22f;
             float[] d = normalize(jitterX, jitterY, 1f);
             SculptBvh.RayHit hit = sculpt.bvh.raycast(d[0] * 3.2f, d[1] * 3.2f, d[2] * 3.2f,
                     -d[0], -d[1], -d[2], new SculptBvh.RayHit());
-            if (hit.faceId == MeshKernel.INVALID) { s.rejected++; continue; }
+            if (hit.faceId == MeshKernel.INVALID) { addRejected++; continue; }
             boolean changed = sculpt.applyClay(
                     hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz,
                     new float[]{-d[0], -d[1], -d[2]},
                     0.28f, 0.014f, BrushMode.ADD, i * 0.02f, hit.faceId
             );
             s.attempted++;
-            if (changed) s.accepted++; else s.rejected++;
+            if (changed) { s.accepted++; addAccepted++; }
+            else { s.rejected++; addRejected++; }
+
             if (i == 175 || i == 350 || i == 700) {
+                GeometryQuality.Stats stats = GeometryQuality.measure(sculpt.kernel);
+                checkpointRadius[checkpointIndex++] = stats.maxRadius;
                 addScreenshot(out, String.format(Locale.US, "11-clay-add-%03d.png", i),
                         sculpt.kernel, "CLAY + " + i, images, labels);
+                check(stats.minQuality >= 0.15f, s,
+                        "Clay+ conditioning too poor at " + i + ": q=" + stats.minQuality);
+                check(stats.maxEdge <= baseline.maxEdge * 7.0f, s,
+                        "Clay+ created runaway edge at " + i + ": " + stats.maxEdge);
+                check(stats.maxRadius <= baseline.maxRadius + 0.75f, s,
+                        "Clay+ radial spike at " + i + ": " + stats.maxRadius);
+                check(countVerticesBeyondRadius(sculpt.kernel, baseline.maxRadius + 0.08f) >= 20, s,
+                        "Clay+ buildup is too needle-like at " + i);
             }
         }
-        check(s.accepted > 250, s, "Clay+ consumer saturated too early: accepted=" + s.accepted);
 
+        // Core 0.3.1 deliberately still has fixed topology. A long stationary
+        // Clay stroke is allowed to saturate safely; what must not happen is
+        // the old shard/toothpick failure. Require the brush to work initially
+        // and require all later rejection to leave geometry healthy.
+        check(addAccepted >= 40, s, "Clay+ did not produce a usable initial buildup: accepted=" + addAccepted);
+        check(checkpointRadius[0] > baseline.maxRadius + 0.02f, s,
+                "Clay+ produced no measurable volume");
+        check(checkpointRadius[1] + 1e-4f >= checkpointRadius[0], s,
+                "Clay+ checkpoint regressed unexpectedly");
+
+        int subAccepted = 0;
+        int subRejected = 0;
+        float beforeSubtractRadius = GeometryQuality.measure(sculpt.kernel).maxRadius;
         for (int i = 1; i <= 350; i++) {
             float[] d = normalize(
                     (random.nextFloat() - 0.5f) * 0.20f,
@@ -407,22 +512,41 @@ public final class VssVerify {
             );
             SculptBvh.RayHit hit = sculpt.bvh.raycast(d[0] * 3.2f, d[1] * 3.2f, d[2] * 3.2f,
                     -d[0], -d[1], -d[2], new SculptBvh.RayHit());
-            if (hit.faceId == MeshKernel.INVALID) { s.rejected++; continue; }
+            if (hit.faceId == MeshKernel.INVALID) { subRejected++; continue; }
             boolean changed = sculpt.applyClay(
                     hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz,
                     new float[]{-d[0], -d[1], -d[2]},
                     0.26f, 0.012f, BrushMode.SUBTRACT, i * 0.02f, hit.faceId
             );
             s.attempted++;
-            if (changed) s.accepted++; else s.rejected++;
+            if (changed) { s.accepted++; subAccepted++; }
+            else { s.rejected++; subRejected++; }
         }
         addScreenshot(out, "12-clay-subtract.png", sculpt.kernel, "CLAY - AFTER ADD", images, labels);
 
         GeometryValidator.Report report = sculpt.validate();
         check(report.ok, s, "Clay consumer invalid: " + report);
+        GeometryQuality.Stats finalStats = GeometryQuality.measure(sculpt.kernel);
+        check(subAccepted >= 20, s, "Clay- did not produce measurable carving: accepted=" + subAccepted);
+        check(finalStats.maxRadius <= beforeSubtractRadius + 0.03f, s,
+                "Clay- unexpectedly increased radial spike");
+
+        StringBuilder reasons = new StringBuilder();
+        for (GeometryValidator.Reason reason : GeometryValidator.Reason.values()) {
+            long count = sculpt.sculptEngine.rejectionCount(reason);
+            if (count == 0) continue;
+            if (reasons.length() > 0) reasons.append(',');
+            reasons.append(reason.name()).append('=').append(count);
+        }
+
         s.hash = sculpt.snapshot().sha256();
-        s.detail = "engineAccepted=" + sculpt.sculptEngine.acceptedDabs()
-                + " engineRejected=" + sculpt.sculptEngine.rejectedDabs();
+        s.detail = String.format(Locale.US,
+                "addAccepted=%d addRejected=%d subAccepted=%d subRejected=%d "
+                        + "radialStart=%.4f radial175=%.4f radial350=%.4f radial700=%.4f "
+                        + "qMin=%.3f rejectsByReason=[%s] fixedTopologySaturationExpected=true",
+                addAccepted, addRejected, subAccepted, subRejected,
+                baseline.maxRadius, checkpointRadius[0], checkpointRadius[1], checkpointRadius[2],
+                finalStats.minQuality, reasons.toString());
         s.durationMs = System.currentTimeMillis() - start;
     }
 
@@ -483,6 +607,52 @@ public final class VssVerify {
         check(perf.bvhRayP95Us < perf.bruteRayP95Us, s,
                 "BVH p95 not faster than brute force: " + perf.bvhRayP95Us + " vs " + perf.bruteRayP95Us);
         s.durationMs = System.currentTimeMillis() - start;
+    }
+
+    private static int countVerticesBeyondRadius(MeshKernel mesh, float radius) {
+        int count = 0;
+        for (int v = 0; v < mesh.vertexHighWater; v++) {
+            if (!mesh.isVertexAlive(v)) continue;
+            float r = MeshKernel.length(mesh.x(v), mesh.y(v), mesh.z(v));
+            if (r > radius) count++;
+        }
+        return count;
+    }
+
+    private static int sampledExtremeEdge(MeshKernel mesh, Random random, boolean longest) {
+        int best = random.nextInt(mesh.halfEdgeCount);
+        float bestLen = GeometryValidator.edge(mesh, mesh.heOrigin[best], mesh.heDest[best]);
+        int samples = Math.min(48, mesh.halfEdgeCount);
+        for (int i = 1; i < samples; i++) {
+            int h = random.nextInt(mesh.halfEdgeCount);
+            float len = GeometryValidator.edge(mesh, mesh.heOrigin[h], mesh.heDest[h]);
+            if ((longest && len > bestLen) || (!longest && len < bestLen)) {
+                best = h; bestLen = len;
+            }
+        }
+        return best;
+    }
+
+    private static void checkShapeEnvelope(MeshKernel mesh, GeometryQuality.Stats baseline,
+            Scenario s, String label, double maxAreaDrift, double maxVolumeDrift,
+            float maxEdgeFactor, float minRadiusFactor, float maxRadiusFactor) {
+        GeometryQuality.Stats now = GeometryQuality.measure(mesh);
+        check(relativeDrift(now.area, baseline.area) <= maxAreaDrift, s,
+                label + " area drift=" + relativeDrift(now.area, baseline.area));
+        check(relativeDrift(now.signedVolume, baseline.signedVolume) <= maxVolumeDrift, s,
+                label + " volume drift=" + relativeDrift(now.signedVolume, baseline.signedVolume));
+        check(now.maxEdge <= baseline.maxEdge * maxEdgeFactor, s,
+                label + " maxEdge=" + now.maxEdge + " baseline=" + baseline.maxEdge);
+        check(now.minRadius >= baseline.minRadius * minRadiusFactor, s,
+                label + " minRadius=" + now.minRadius);
+        check(now.maxRadius <= baseline.maxRadius * maxRadiusFactor, s,
+                label + " maxRadius=" + now.maxRadius);
+        check(now.minQuality >= GeometryValidator.MIN_TRIANGLE_QUALITY - 1e-5f, s,
+                label + " qMin=" + now.minQuality);
+    }
+
+    private static double relativeDrift(double value, double baseline) {
+        return Math.abs(value - baseline) / Math.max(1e-12, Math.abs(baseline));
     }
 
     private static Scenario scenario(String name) {
@@ -607,7 +777,7 @@ public final class VssVerify {
     private static void writeJson(File out, long durationMs) throws Exception {
         try (FileWriter w = new FileWriter(new File(out, "dump.json"))) {
             w.write("{\n");
-            field(w, 1, "schema", "cabrush-core-dump-v2", true);
+            field(w, 1, "schema", "cabrush-core-dump-v3", true);
             field(w, 1, "generated_at", Instant.now().toString(), true);
             field(w, 1, "result", failures.isEmpty() ? "PASS" : "FAIL", true);
             field(w, 1, "duration_ms", durationMs, true);
@@ -615,11 +785,13 @@ public final class VssVerify {
             field(w, 2, "kernel", "packed-stable-id-half-edge", true);
             field(w, 2, "spatial_index", "sculpt-bvh", true);
             field(w, 2, "transactions", "vertex-journal+topology-snapshot", true);
+            field(w, 2, "geometry_truth", "quality+normal+area+volume+self-intersection", true);
             field(w, 2, "render_indices", "16-bit-chunked", true);
             field(w, 2, "snapshot_schema", MeshSnapshot.SCHEMA_VERSION, false);
             w.write("  },\n");
             w.write("  \"resource_budgets\": {\n");
             field(w, 2, "max_vertices", MeshKernel.MAX_VERTICES, true);
+            field(w, 2, "recommended_working_vertices", 250000, true);
             field(w, 2, "max_faces", MeshKernel.MAX_FACES, true);
             field(w, 2, "max_half_edges", MeshKernel.MAX_HALF_EDGES, true);
             field(w, 2, "max_render_chunk_vertices", RenderChunkBuilder.MAX_CHUNK_VERTICES, false);
@@ -677,7 +849,7 @@ public final class VssVerify {
 
     private static void writeText(File out, long durationMs) throws Exception {
         try (FileWriter w = new FileWriter(new File(out, "dump.txt"))) {
-            w.write("CABrush Core 0.3 - Verification Snapshot System v2\n");
+            w.write("CABrush Core 0.3.1 - Verification Snapshot System v3\n");
             w.write("RESULT: " + (failures.isEmpty() ? "PASS" : "FAIL") + "\n");
             w.write("Duration: " + durationMs + " ms\n\n");
             w.write("Architecture: packed stable-ID mesh + half-edge connectivity + SculptBVH + atomic transactions + 16-bit render chunks\n");

@@ -10,8 +10,8 @@ android {
         applicationId 'com.fallpoint.pocketsculpt'
         minSdk 24
         targetSdk 35
-        versionCode 7
-        versionName '0.3.0'
+        versionCode 8
+        versionName '0.3.1'
     }
 
     buildTypes {
@@ -27,7 +27,7 @@ android {
     }
 }
 
-// Core 0.3 VSS compiles the exact dependency-free mesh/sculpt kernel used by
+// Core 0.3.1 VSS compiles the exact dependency-free mesh/sculpt kernel used by
 // Android. app:preBuild depends on vssVerify, so no APK can be produced from a
 // kernel that fails topology, BVH, rollback, snapshot, render-chunk, scale or
 // deterministic-replay verification.
@@ -40,6 +40,7 @@ tasks.register('vssCompile', JavaCompile) {
             'src/main/java/com/fallpoint/pocketsculpt/PrimitiveLongIntMap.java',
             'src/main/java/com/fallpoint/pocketsculpt/MeshKernel.java',
             'src/main/java/com/fallpoint/pocketsculpt/MeshSnapshot.java',
+            'src/main/java/com/fallpoint/pocketsculpt/GeometryQuality.java',
             'src/main/java/com/fallpoint/pocketsculpt/GeometryValidator.java',
             'src/main/java/com/fallpoint/pocketsculpt/GeometryTransaction.java',
             'src/main/java/com/fallpoint/pocketsculpt/GeometryOps.java',

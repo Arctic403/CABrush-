@@ -102,10 +102,28 @@ final class SculptEngine {
             for (int i = 0; i < selectedCount; i++) {
                 int v = selectedVertices[i];
                 int dst = v * 3, src = i * 3;
-                float amount = sign * step * selectedWeights[i] * lineScale;
-                mesh.positions[dst] = basePositions[src] + nx * amount;
-                mesh.positions[dst + 1] = basePositions[src + 1] + ny * amount;
-                mesh.positions[dst + 2] = basePositions[src + 2] + nz * amount;
+                // Clay is a plane-aware volume brush, not an unlimited Draw
+                // extrusion. Move each point toward a slightly offset sculpt
+                // plane. Curved/low surrounding points therefore travel with
+                // the center and the brush naturally flattens while building.
+                float px = basePositions[src];
+                float py = basePositions[src + 1];
+                float pz = basePositions[src + 2];
+                float signed = (px - stroke.hitX) * nx
+                        + (py - stroke.hitY) * ny
+                        + (pz - stroke.hitZ) * nz;
+                float target = sign * step * 1.20f;
+                float planeDelta = target - signed;
+                if ((sign > 0f && planeDelta < 0f) || (sign < 0f && planeDelta > 0f)) {
+                    planeDelta = 0f;
+                }
+                float maxAmount = step * 1.35f;
+                float amount = Math.max(-maxAmount, Math.min(maxAmount,
+                        planeDelta * selectedWeights[i] * 0.72f * lineScale));
+
+                mesh.positions[dst] = px + nx * amount;
+                mesh.positions[dst + 1] = py + ny * amount;
+                mesh.positions[dst + 2] = pz + nz * amount;
             }
             GeometryTransaction.Result result = transaction.commitVertexEdit();
             if (result.committed) {
@@ -149,8 +167,6 @@ final class SculptEngine {
         float dx = mesh.positions[b] - stroke.hitX;
         float dy = mesh.positions[b + 1] - stroke.hitY;
         float dz = mesh.positions[b + 2] - stroke.hitZ;
-        float d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 > supportSq) return count;
 
         mesh.ensureNormals();
         float facing = -(mesh.normals[b] * stroke.viewX
@@ -158,15 +174,27 @@ final class SculptEngine {
                 + mesh.normals[b + 2] * stroke.viewZ);
         if (facing <= 0.015f) return count;
 
-        float d = (float)Math.sqrt(d2);
+        // Brush footprint is measured in the tangent plane instead of raw 3D
+        // distance from the current tip. This keeps the base of a clay mound
+        // participating as volume accumulates and prevents the "toothpick"
+        // extrusion seen in the Core 0.3 screenshots.
+        float hitNLen = MeshKernel.length(stroke.normalX, stroke.normalY, stroke.normalZ);
+        float hnx = hitNLen > 1e-8f ? stroke.normalX / hitNLen : 0f;
+        float hny = hitNLen > 1e-8f ? stroke.normalY / hitNLen : 0f;
+        float hnz = hitNLen > 1e-8f ? stroke.normalZ / hitNLen : 1f;
+        float depth = dx * hnx + dy * hny + dz * hnz;
+        float tx = dx - hnx * depth;
+        float ty = dy - hny * depth;
+        float tz = dz - hnz * depth;
+        float tangentSq = tx * tx + ty * ty + tz * tz;
+        if (tangentSq > supportSq || Math.abs(depth) > stroke.radius * 1.70f) return count;
+
+        float d = (float)Math.sqrt(tangentSq);
         float u = Math.max(0f, Math.min(1f, 1f - d / supportRadius));
         float smooth = u * u * (3f - 2f * u);
-        // Keep a soft support ring outside the nominal radius so nearby
-        // topology travels with the buildup instead of the center stretching
-        // away from a static boundary.
-        float nominal = stroke.radius / supportRadius;
         float supportScale = d <= stroke.radius ? 1f : 0.42f;
-        float weight = smooth * supportScale;
+        float depthScale = 1f - Math.min(0.45f, Math.abs(depth) / (stroke.radius * 3.0f));
+        float weight = smooth * supportScale * depthScale;
         if (weight <= 1e-5f) return count;
 
         ensureSelectedCapacity(count + 1);

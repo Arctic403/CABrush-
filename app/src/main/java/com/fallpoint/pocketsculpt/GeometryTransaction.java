@@ -68,11 +68,73 @@ final class GeometryTransaction {
             rollbackVertexEdit();
             return Result.fail(local);
         }
+
+        // A face can remain topologically legal while turning almost inside-out.
+        // Compare each touched face against the exact pre-edit vertex journal.
+        GeometryValidator.Report motion = validateTouchedFaceMotion();
+        if (!motion.ok) {
+            rollbackVertexEdit();
+            return Result.fail(motion);
+        }
+
         mesh.geometryVersion++;
         mesh.recomputeNormalsAll();
         vertexCount = 0;
         touchedFaceCount = 0;
         return Result.ok();
+    }
+
+    private GeometryValidator.Report validateTouchedFaceMotion() {
+        for (int i = 0; i < touchedFaceCount; i++) {
+            int face = touchedFaces[i];
+            if (!mesh.isFaceAlive(face)) continue;
+            int a = mesh.faceA[face], b = mesh.faceB[face], c = mesh.faceC[face];
+
+            float[] oldA = oldOrCurrent(a);
+            float[] oldB = oldOrCurrent(b);
+            float[] oldC = oldOrCurrent(c);
+            float[] newA = {mesh.x(a), mesh.y(a), mesh.z(a)};
+            float[] newB = {mesh.x(b), mesh.y(b), mesh.z(b)};
+            float[] newC = {mesh.x(c), mesh.y(c), mesh.z(c)};
+
+            float[] oldN = cross(sub(oldB, oldA), sub(oldC, oldA));
+            float[] newN = cross(sub(newB, newA), sub(newC, newA));
+            float oldLen = MeshKernel.length(oldN[0], oldN[1], oldN[2]);
+            float newLen = MeshKernel.length(newN[0], newN[1], newN[2]);
+            if (oldLen < 1e-10f || newLen < 1e-10f) {
+                return GeometryValidator.Report.fail(GeometryValidator.Reason.DEGENERATE_TRIANGLE, face, "motion area");
+            }
+            float dot = (oldN[0]*newN[0] + oldN[1]*newN[1] + oldN[2]*newN[2]) / (oldLen*newLen);
+            if (!Float.isFinite(dot) || dot < 0.20f) {
+                return GeometryValidator.Report.fail(GeometryValidator.Reason.NORMAL_CHANGE, face, "dot=" + dot);
+            }
+            float ratio = newLen / oldLen;
+            if (ratio < 0.45f || ratio > 2.20f) {
+                return GeometryValidator.Report.fail(GeometryValidator.Reason.LOCAL_AREA_DRIFT, face, "faceAreaRatio=" + ratio);
+            }
+        }
+        return GeometryValidator.Report.ok();
+    }
+
+    private float[] oldOrCurrent(int vertex) {
+        for (int i = 0; i < vertexCount; i++) {
+            if (vertices[i] != vertex) continue;
+            int b = i * 3;
+            return new float[]{oldPositions[b], oldPositions[b + 1], oldPositions[b + 2]};
+        }
+        return new float[]{mesh.x(vertex), mesh.y(vertex), mesh.z(vertex)};
+    }
+
+    private static float[] sub(float[] a, float[] b) {
+        return new float[]{a[0]-b[0], a[1]-b[1], a[2]-b[2]};
+    }
+
+    private static float[] cross(float[] a, float[] b) {
+        return new float[]{
+                a[1]*b[2]-a[2]*b[1],
+                a[2]*b[0]-a[0]*b[2],
+                a[0]*b[1]-a[1]*b[0]
+        };
     }
 
     void rollbackVertexEdit() {
@@ -98,7 +160,8 @@ final class GeometryTransaction {
             }
             mesh.ensureConnectivity();
             mesh.recomputeNormalsAll();
-            GeometryValidator.Report report = GeometryValidator.validate(mesh, requireClosed);
+            GeometryValidator.Report report =
+                    GeometryValidator.validateTopologyTransition(before, mesh, requireClosed);
             if (!report.ok) {
                 before.restoreInto(mesh);
                 return Result.fail(report);
