@@ -10,8 +10,8 @@ android {
         applicationId 'com.fallpoint.pocketsculpt'
         minSdk 24
         targetSdk 35
-        versionCode 6
-        versionName '0.2.0'
+        versionCode 7
+        versionName '0.3.0'
     }
 
     buildTypes {
@@ -27,16 +27,26 @@ android {
     }
 }
 
-// VSS = Verification Snapshot System.
-// Every Android build is gated by a deterministic pure-Java stress run.
-// The verifier writes screenshots + dump.json/dump.txt into app/build/vss/report.
-// If any geometry invariant fails, VSS exits non-zero and preBuild is blocked.
+// Core 0.3 VSS compiles the exact dependency-free mesh/sculpt kernel used by
+// Android. app:preBuild depends on vssVerify, so no APK can be produced from a
+// kernel that fails topology, BVH, rollback, snapshot, render-chunk, scale or
+// deterministic-replay verification.
 def vssClassesDir = layout.buildDirectory.dir('vss/classes')
 def vssReportDir = layout.buildDirectory.dir('vss/report')
 
 tasks.register('vssCompile', JavaCompile) {
     source = files(
             'src/main/java/com/fallpoint/pocketsculpt/BrushMode.java',
+            'src/main/java/com/fallpoint/pocketsculpt/PrimitiveLongIntMap.java',
+            'src/main/java/com/fallpoint/pocketsculpt/MeshKernel.java',
+            'src/main/java/com/fallpoint/pocketsculpt/MeshSnapshot.java',
+            'src/main/java/com/fallpoint/pocketsculpt/GeometryValidator.java',
+            'src/main/java/com/fallpoint/pocketsculpt/GeometryTransaction.java',
+            'src/main/java/com/fallpoint/pocketsculpt/GeometryOps.java',
+            'src/main/java/com/fallpoint/pocketsculpt/SculptBvh.java',
+            'src/main/java/com/fallpoint/pocketsculpt/StrokeContext.java',
+            'src/main/java/com/fallpoint/pocketsculpt/RenderChunkBuilder.java',
+            'src/main/java/com/fallpoint/pocketsculpt/SculptEngine.java',
             'src/main/java/com/fallpoint/pocketsculpt/SculptMesh.java',
             '../tools/VssVerify.java'
     )
@@ -52,7 +62,7 @@ tasks.register('vssVerify', JavaExec) {
     classpath = files(vssClassesDir)
     mainClass.set('com.fallpoint.pocketsculpt.VssVerify')
     args(vssReportDir.get().asFile.absolutePath)
-    jvmArgs '-Djava.awt.headless=true'
+    jvmArgs '-Djava.awt.headless=true', '-Xmx1400m'
 }
 
 tasks.named('preBuild').configure {

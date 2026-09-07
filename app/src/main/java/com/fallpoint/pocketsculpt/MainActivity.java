@@ -47,7 +47,7 @@ public class MainActivity extends Activity {
         bar.setBackgroundResource(R.drawable.panel_bg);
 
         TextView title = new TextView(this);
-        title.setText("CABrush Core 0.2");
+        title.setText("CABrush Core 0.3");
         title.setTextColor(Color.WHITE);
         title.setTextSize(17f);
         title.setTypeface(null, android.graphics.Typeface.BOLD);

@@ -12,7 +12,7 @@ concurrency:
 jobs:
   verify-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -30,16 +30,15 @@ jobs:
       - name: Install SDK 35
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
-      # app:preBuild depends on vssVerify, so a broken sculpt core can never
-      # proceed to Android compilation. VSS generates evidence before failing.
-      - name: VSS verification + APK build
+      # app:preBuild is hard-gated by Core 0.3 VSS.
+      - name: Core verification + APK build
         run: gradle assembleDebug
 
       - name: Upload VSS dump and screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CABrush-VSS
+          name: CABrush-Core-0.3-VSS
           path: app/build/vss/report/**
           if-no-files-found: warn
 
@@ -47,5 +46,5 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: CABrush-core-0.2-debug
+          name: CABrush-core-0.3-debug
           path: app/build/outputs/apk/debug/app-debug.apk

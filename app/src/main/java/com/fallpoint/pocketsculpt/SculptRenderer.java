@@ -7,11 +7,15 @@ import android.opengl.Matrix;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
-import java.nio.IntBuffer;
+import java.nio.ShortBuffer;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
+/**
+ * Android GL shell. CPU mesh truth is owned by MeshKernel; the renderer consumes
+ * 16-bit RenderChunkBuilder plans and can recreate all GPU state after EGL loss.
+ */
 public final class SculptRenderer implements GLSurfaceView.Renderer {
     private final float[] projection = new float[16];
     private final float[] view = new float[16];
@@ -19,11 +23,16 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
     private final float[] vp = new float[16];
     private final float[] mvp = new float[16];
     private final float[] inverseMvp = new float[16];
+    private final float[] unprojectIn = new float[4];
+    private final float[] unprojectOut = new float[4];
+    private final float[] rayNear = new float[3];
+    private final float[] rayFar = new float[3];
+    private final Ray rayScratch = new Ray();
 
     private SculptMesh mesh;
-    private FloatBuffer positionBuffer;
-    private FloatBuffer normalBuffer;
-    private IntBuffer indexBuffer;
+    private GpuChunk[] gpuChunks = new GpuChunk[0];
+    private long uploadedTopologyVersion = Long.MIN_VALUE;
+    private long uploadedGeometryVersion = Long.MIN_VALUE;
 
     private int program;
     private int aPosition;
@@ -42,11 +51,11 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
     private float pitch = 8f;
     private float cameraDistance = 4.0f;
 
-    private boolean buffersDirty = true;
-    private boolean strokeActive = false;
-    private boolean hasLastDab = false;
+    private boolean strokeActive;
+    private boolean hasLastDab;
     private float lastDabX;
     private float lastDabY;
+    private float accumulatedStrokeDistance;
 
     @Override
     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
@@ -62,8 +71,12 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         uLightDirection = GLES30.glGetUniformLocation(program, "uLightDirection");
 
         if (mesh == null) mesh = SculptMesh.createSphere();
-        allocateBuffers();
         Matrix.setIdentityM(model, 0);
+
+        // EGL recreation must never reset CPU sculpt state.
+        uploadedTopologyVersion = Long.MIN_VALUE;
+        uploadedGeometryVersion = Long.MIN_VALUE;
+        gpuChunks = new GpuChunk[0];
     }
 
     @Override
@@ -79,21 +92,29 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         if (mesh == null) return;
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT | GLES30.GL_DEPTH_BUFFER_BIT);
         updateMatrices();
-        if (buffersDirty) uploadMesh();
+
+        RenderChunkBuilder.RenderPlan plan = mesh.renderPlan();
+        syncGpuChunks(plan);
 
         GLES30.glUseProgram(program);
         GLES30.glUniformMatrix4fv(uMvp, 1, false, mvp, 0);
         GLES30.glUniform3f(uLightDirection, -0.35f, 0.72f, 0.58f);
 
-        positionBuffer.position(0);
-        normalBuffer.position(0);
-        indexBuffer.position(0);
-
         GLES30.glEnableVertexAttribArray(aPosition);
-        GLES30.glVertexAttribPointer(aPosition, 3, GLES30.GL_FLOAT, false, 0, positionBuffer);
         GLES30.glEnableVertexAttribArray(aNormal);
-        GLES30.glVertexAttribPointer(aNormal, 3, GLES30.GL_FLOAT, false, 0, normalBuffer);
-        GLES30.glDrawElements(GLES30.GL_TRIANGLES, mesh.indices.length, GLES30.GL_UNSIGNED_INT, indexBuffer);
+        for (GpuChunk chunk : gpuChunks) {
+            chunk.positionBuffer.position(0);
+            chunk.normalBuffer.position(0);
+            chunk.indexBuffer.position(0);
+            GLES30.glVertexAttribPointer(aPosition, 3, GLES30.GL_FLOAT, false, 0, chunk.positionBuffer);
+            GLES30.glVertexAttribPointer(aNormal, 3, GLES30.GL_FLOAT, false, 0, chunk.normalBuffer);
+            GLES30.glDrawElements(
+                    GLES30.GL_TRIANGLES,
+                    chunk.indexCount,
+                    GLES30.GL_UNSIGNED_SHORT,
+                    chunk.indexBuffer
+            );
+        }
         GLES30.glDisableVertexAttribArray(aPosition);
         GLES30.glDisableVertexAttribArray(aNormal);
     }
@@ -103,30 +124,34 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
     }
 
     public void setBrushRadius(float radius) {
-        brushRadius = Math.max(0.05f, Math.min(0.70f, radius));
+        brushRadius = clamp(radius, 0.05f, 0.70f);
     }
 
     public void setBrushStrength(float strength) {
-        brushStrength = Math.max(0.001f, Math.min(0.060f, strength));
+        brushStrength = clamp(strength, 0.001f, 0.060f);
     }
 
     public void resetMesh() {
         if (mesh == null) return;
         mesh.reset();
-        buffersDirty = true;
         strokeActive = false;
         hasLastDab = false;
+        accumulatedStrokeDistance = 0f;
+        uploadedTopologyVersion = Long.MIN_VALUE;
+        uploadedGeometryVersion = Long.MIN_VALUE;
     }
 
     public void beginStroke() {
         if (mesh == null) return;
         strokeActive = true;
         hasLastDab = false;
+        accumulatedStrokeDistance = 0f;
     }
 
     public void endStroke() {
         strokeActive = false;
         hasLastDab = false;
+        accumulatedStrokeDistance = 0f;
     }
 
     public void sculptAt(float screenX, float screenY) {
@@ -153,6 +178,7 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         for (int i = 1; i <= steps; i++) {
             float travel = Math.min(distance, spacing * i);
             float t = travel / Math.max(distance, 1e-6f);
+            accumulatedStrokeDistance += spacing;
             sculptDab(startX + dx * t, startY + dy * t);
         }
 
@@ -180,21 +206,41 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         SculptMesh.Hit hit = mesh.raycast(ray.origin, ray.direction);
         if (hit == null) return false;
 
-        boolean changed = mesh.applyClay(
+        return mesh.applyClay(
                 hit.x, hit.y, hit.z,
                 hit.nx, hit.ny, hit.nz,
                 ray.direction,
                 brushRadius,
                 brushStrength,
-                brushMode
+                brushMode,
+                accumulatedStrokeDistance,
+                hit.faceId
         );
-        if (changed) buffersDirty = true;
-        return changed;
     }
 
     private float brushSpacingPixels() {
         float projected = brushRadius * height / Math.max(1.5f, cameraDistance);
         return clamp(projected * 0.18f, 3.0f, 28.0f);
+    }
+
+    private void syncGpuChunks(RenderChunkBuilder.RenderPlan plan) {
+        if (uploadedTopologyVersion != plan.topologyVersion || gpuChunks.length != plan.chunks.length) {
+            gpuChunks = new GpuChunk[plan.chunks.length];
+            for (int i = 0; i < plan.chunks.length; i++) {
+                RenderChunkBuilder.Chunk source = plan.chunks[i];
+                gpuChunks[i] = new GpuChunk(source);
+            }
+            uploadedTopologyVersion = plan.topologyVersion;
+            uploadedGeometryVersion = plan.geometryVersion;
+            return;
+        }
+
+        if (uploadedGeometryVersion != plan.geometryVersion) {
+            for (int i = 0; i < gpuChunks.length; i++) {
+                gpuChunks[i].uploadGeometry(plan.chunks[i]);
+            }
+            uploadedGeometryVersion = plan.geometryVersion;
+        }
     }
 
     private void updateMatrices() {
@@ -215,46 +261,36 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         float nx = (2f * x / Math.max(1, width)) - 1f;
         float ny = 1f - (2f * y / Math.max(1, height));
 
-        float[] near = unproject(nx, ny, -1f);
-        float[] far = unproject(nx, ny, 1f);
-        if (near == null || far == null) return null;
+        if (!unprojectInto(nx, ny, -1f, rayNear)) return null;
+        if (!unprojectInto(nx, ny, 1f, rayFar)) return null;
 
-        float dx = far[0] - near[0];
-        float dy = far[1] - near[1];
-        float dz = far[2] - near[2];
+        float dx = rayFar[0] - rayNear[0];
+        float dy = rayFar[1] - rayNear[1];
+        float dz = rayFar[2] - rayNear[2];
         float len = (float)Math.sqrt(dx * dx + dy * dy + dz * dz);
         if (len < 1e-8f) return null;
 
-        return new Ray(near, new float[]{dx / len, dy / len, dz / len});
+        rayScratch.origin[0] = rayNear[0];
+        rayScratch.origin[1] = rayNear[1];
+        rayScratch.origin[2] = rayNear[2];
+        rayScratch.direction[0] = dx / len;
+        rayScratch.direction[1] = dy / len;
+        rayScratch.direction[2] = dz / len;
+        return rayScratch;
     }
 
-    private float[] unproject(float x, float y, float z) {
-        float[] in = {x, y, z, 1f};
-        float[] out = new float[4];
-        Matrix.multiplyMV(out, 0, inverseMvp, 0, in, 0);
-        if (Math.abs(out[3]) < 1e-8f || !Float.isFinite(out[3])) return null;
-        float invW = 1f / out[3];
-        return new float[]{out[0] * invW, out[1] * invW, out[2] * invW};
-    }
-
-    private void allocateBuffers() {
-        if (mesh == null) return;
-        positionBuffer = ByteBuffer.allocateDirect(mesh.positions.length * 4)
-                .order(ByteOrder.nativeOrder()).asFloatBuffer();
-        normalBuffer = ByteBuffer.allocateDirect(mesh.normals.length * 4)
-                .order(ByteOrder.nativeOrder()).asFloatBuffer();
-        indexBuffer = ByteBuffer.allocateDirect(mesh.indices.length * 4)
-                .order(ByteOrder.nativeOrder()).asIntBuffer();
-        indexBuffer.put(mesh.indices).position(0);
-        buffersDirty = true;
-    }
-
-    private void uploadMesh() {
-        positionBuffer.position(0);
-        positionBuffer.put(mesh.positions).position(0);
-        normalBuffer.position(0);
-        normalBuffer.put(mesh.normals).position(0);
-        buffersDirty = false;
+    private boolean unprojectInto(float x, float y, float z, float[] dst) {
+        unprojectIn[0] = x;
+        unprojectIn[1] = y;
+        unprojectIn[2] = z;
+        unprojectIn[3] = 1f;
+        Matrix.multiplyMV(unprojectOut, 0, inverseMvp, 0, unprojectIn, 0);
+        if (Math.abs(unprojectOut[3]) < 1e-8f || !Float.isFinite(unprojectOut[3])) return false;
+        float invW = 1f / unprojectOut[3];
+        dst[0] = unprojectOut[0] * invW;
+        dst[1] = unprojectOut[1] * invW;
+        dst[2] = unprojectOut[2] * invW;
+        return Float.isFinite(dst[0]) && Float.isFinite(dst[1]) && Float.isFinite(dst[2]);
     }
 
     private static int buildProgram(String vertexSource, String fragmentSource) {
@@ -295,13 +331,35 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         return Math.max(min, Math.min(max, value));
     }
 
-    private static final class Ray {
-        final float[] origin;
-        final float[] direction;
-        Ray(float[] origin, float[] direction) {
-            this.origin = origin;
-            this.direction = direction;
+    private static final class GpuChunk {
+        final FloatBuffer positionBuffer;
+        final FloatBuffer normalBuffer;
+        final ShortBuffer indexBuffer;
+        final int indexCount;
+
+        GpuChunk(RenderChunkBuilder.Chunk source) {
+            positionBuffer = ByteBuffer.allocateDirect(source.positions.length * 4)
+                    .order(ByteOrder.nativeOrder()).asFloatBuffer();
+            normalBuffer = ByteBuffer.allocateDirect(source.normals.length * 4)
+                    .order(ByteOrder.nativeOrder()).asFloatBuffer();
+            indexBuffer = ByteBuffer.allocateDirect(source.indices.length * 2)
+                    .order(ByteOrder.nativeOrder()).asShortBuffer();
+            indexBuffer.put(source.indices).position(0);
+            indexCount = source.indices.length;
+            uploadGeometry(source);
         }
+
+        void uploadGeometry(RenderChunkBuilder.Chunk source) {
+            positionBuffer.position(0);
+            positionBuffer.put(source.positions).position(0);
+            normalBuffer.position(0);
+            normalBuffer.put(source.normals).position(0);
+        }
+    }
+
+    private static final class Ray {
+        final float[] origin = new float[3];
+        final float[] direction = new float[3];
     }
 
     private static final String VERTEX_SHADER =
