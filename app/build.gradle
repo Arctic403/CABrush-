@@ -10,8 +10,8 @@ android {
         applicationId 'com.fallpoint.pocketsculpt'
         minSdk 24
         targetSdk 35
-        versionCode 5
-        versionName '0.1.4'
+        versionCode 6
+        versionName '0.2.0'
     }
 
     buildTypes {
@@ -25,4 +25,36 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+// VSS = Verification Snapshot System.
+// Every Android build is gated by a deterministic pure-Java stress run.
+// The verifier writes screenshots + dump.json/dump.txt into app/build/vss/report.
+// If any geometry invariant fails, VSS exits non-zero and preBuild is blocked.
+def vssClassesDir = layout.buildDirectory.dir('vss/classes')
+def vssReportDir = layout.buildDirectory.dir('vss/report')
+
+tasks.register('vssCompile', JavaCompile) {
+    source = files(
+            'src/main/java/com/fallpoint/pocketsculpt/BrushMode.java',
+            'src/main/java/com/fallpoint/pocketsculpt/SculptMesh.java',
+            '../tools/VssVerify.java'
+    )
+    classpath = files()
+    destinationDirectory.set(vssClassesDir)
+    options.encoding = 'UTF-8'
+    sourceCompatibility = '17'
+    targetCompatibility = '17'
+}
+
+tasks.register('vssVerify', JavaExec) {
+    dependsOn 'vssCompile'
+    classpath = files(vssClassesDir)
+    mainClass.set('com.fallpoint.pocketsculpt.VssVerify')
+    args(vssReportDir.get().asFile.absolutePath)
+    jvmArgs '-Djava.awt.headless=true'
+}
+
+tasks.named('preBuild').configure {
+    dependsOn 'vssVerify'
 }
