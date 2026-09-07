@@ -49,7 +49,7 @@ public class MainActivity extends Activity {
         bar.setBackgroundResource(com.fallpoint.pocketsculpt.R.drawable.panel_bg);
 
         TextView title = new TextView(this);
-        title.setText("PocketSculpt  V1");
+        title.setText("PocketSculpt  V1.1");
         title.setTextColor(Color.WHITE);
         title.setTextSize(17f);
         title.setTypeface(null, android.graphics.Typeface.BOLD);

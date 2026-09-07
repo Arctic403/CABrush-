@@ -50,6 +50,9 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
 
     private boolean buffersDirty = true;
     private boolean strokeActive = false;
+    private boolean hasLastDab = false;
+    private float lastDabX;
+    private float lastDabY;
     private float[] strokeStartSnapshot;
     private final Deque<float[]> undoStack = new ArrayDeque<>();
     private final Deque<float[]> redoStack = new ArrayDeque<>();
@@ -68,7 +71,7 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         uModel = GLES30.glGetUniformLocation(program, "uModel");
         uLightDirection = GLES30.glGetUniformLocation(program, "uLightDirection");
 
-        mesh = SculptMesh.createUvSphere(32, 48, 1f);
+        mesh = SculptMesh.createIcoSphere(4, 1f);
         allocateBuffers();
         Matrix.setIdentityM(model, 0);
     }
@@ -129,12 +132,14 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
     public void beginStroke() {
         if (mesh == null || strokeActive) return;
         strokeActive = true;
+        hasLastDab = false;
         strokeStartSnapshot = mesh.copyPositions();
     }
 
     public void endStroke() {
         if (!strokeActive || mesh == null) return;
         strokeActive = false;
+        hasLastDab = false;
         if (strokeStartSnapshot != null && !samePositions(strokeStartSnapshot, mesh.positions)) {
             undoStack.push(strokeStartSnapshot);
             trimHistory(undoStack);
@@ -144,19 +149,88 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
     }
 
     public void sculptAt(float screenX, float screenY) {
-        if (mesh == null) return;
+        if (mesh == null || !strokeActive) return;
+
+        if (!hasLastDab) {
+            if (sculptDab(screenX, screenY)) {
+                lastDabX = screenX;
+                lastDabY = screenY;
+                hasLastDab = true;
+            }
+            return;
+        }
+
+        float dx = screenX - lastDabX;
+        float dy = screenY - lastDabY;
+        float distance = (float) Math.sqrt(dx * dx + dy * dy);
+        float spacing = brushSpacingPixels();
+        if (distance < spacing) return;
+
+        float startX = lastDabX;
+        float startY = lastDabY;
+        int steps = Math.min(32, (int) (distance / spacing));
+        float invDistance = distance > 1e-6f ? 1f / distance : 0f;
+
+        for (int i = 1; i <= steps; i++) {
+            float travel = spacing * i;
+            float t = Math.min(1f, travel * invDistance);
+            sculptDab(startX + dx * t, startY + dy * t);
+        }
+
+        float consumed = Math.min(distance, spacing * steps);
+        float t = consumed * invDistance;
+        lastDabX = startX + dx * t;
+        lastDabY = startY + dy * t;
+    }
+
+    private boolean sculptDab(float screenX, float screenY) {
         updateMatrices();
         Ray ray = screenRay(screenX, screenY);
-        if (ray == null) return;
-        float[] hit = mesh.raycast(ray.origin, ray.direction);
-        if (hit == null) return;
+        if (ray == null) return false;
 
-        mesh.applyBrush(hit[0], hit[1], hit[2], brushRadius, brushStrength, brushMode);
+        SculptMesh.Hit hit = mesh.raycast(ray.origin, ray.direction);
+        if (hit == null) return false;
+
+        mesh.applyBrush(
+                hit.x, hit.y, hit.z,
+                hit.nx, hit.ny, hit.nz,
+                ray.direction,
+                brushRadius,
+                brushStrength,
+                brushMode,
+                true
+        );
+
         if (symmetryX) {
-            mesh.applyBrush(-hit[0], hit[1], hit[2], brushRadius, brushStrength, brushMode);
+            float[] mirroredView = new float[]{
+                    -ray.direction[0],
+                    ray.direction[1],
+                    ray.direction[2]
+            };
+            mesh.applyBrush(
+                    -hit.x, hit.y, hit.z,
+                    -hit.nx, hit.ny, hit.nz,
+                    mirroredView,
+                    brushRadius,
+                    brushStrength,
+                    brushMode,
+                    false
+            );
         }
+
         mesh.recalculateNormals();
         buffersDirty = true;
+        return true;
+    }
+
+    private float brushSpacingPixels() {
+        float visibleWorldHeight = 2f * cameraDistance
+                * (float) Math.tan(Math.toRadians(42f * 0.5f));
+        float worldPerPixel = visibleWorldHeight / Math.max(1f, height);
+        if (worldPerPixel < 1e-6f) return 8f;
+
+        float spacing = (brushRadius * 0.18f) / worldPerPixel;
+        return Math.max(4f, Math.min(22f, spacing));
     }
 
     public void adjustCamera(float dxPixels, float dyPixels, float pinchPixels) {

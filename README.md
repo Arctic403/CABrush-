@@ -1,11 +1,26 @@
-# PocketSculpt V1
+# PocketSculpt V1.1
 
-A deliberately small Android-native sculpting prototype: a touch-first proof that the core mobile sculpt workflow works before moving the hot path into C++/NDK.
+A deliberately small Android-native sculpting prototype focused on making the first sculpt core stable on real phones before moving the hot path into C++/NDK.
 
-## V1 features
+## V1.1 hardening patch
+
+This patch fixes the topology failure seen in V1 where repeated strokes could pull the sphere into giant sheets, spikes, and apparent holes.
+
+- Replaced the unwelded UV sphere with a watertight subdivided icosphere.
+- 2,562 shared vertices / 5,120 triangles at startup.
+- No duplicated longitude seam and no collapsed UV-sphere pole rows.
+- Brush dabs are spaced by brush radius instead of applying once for every raw Android MOVE event.
+- Clay Add/Subtract use one averaged local surface normal instead of pushing every vertex along a diverging per-vertex normal.
+- Primary strokes filter to the front-facing, topologically connected patch around the ray hit.
+- Per-vertex displacement is clamped against local edge length.
+- Candidate moves are rejected if they would nearly collapse or strongly flip an incident triangle.
+- Smooth now uses a two-pass Taubin-style relaxation to reduce the shrinkage of the old one-pass Laplacian smooth.
+- X symmetry remains supported; the mirrored dab receives the same topology safety checks.
+- Normal rebuilding remains CPU-side after accepted brush dabs.
+
+## Features
 
 - Real-time OpenGL ES 3.0 shaded mesh
-- Procedural sculptable sphere (~1.6k vertices / ~3k triangles)
 - Clay Add brush
 - Clay Subtract brush
 - Smooth brush
@@ -17,14 +32,14 @@ A deliberately small Android-native sculpting prototype: a touch-first proof tha
 - Two-finger orbit
 - Pinch zoom
 - CPU triangle ray-picking against the deformed mesh
-- Normal recalculation after edits
-- No native libraries, so V1 is ABI-neutral and runs as one APK on both 32-bit and 64-bit Android devices that support OpenGL ES 3.0
+- Stroke-level undo snapshots
+- No native libraries, so V1.1 remains ABI-neutral and runs as one APK on both 32-bit and 64-bit Android devices that support OpenGL ES 3.0
 
 ## Build
 
 ### Android Studio
 
-1. Open the `PocketSculpt-v1` folder.
+1. Open the repository.
 2. Let Gradle sync.
 3. Install Android SDK Platform 35 if Android Studio asks.
 4. Run the `app` configuration on an Android 7.0+ device.
@@ -37,9 +52,9 @@ With Gradle 8.7 installed:
 gradle assembleDebug
 ```
 
-The repository also includes a GitHub Actions workflow that installs Gradle 8.7 + Android SDK 35 and uploads the debug APK as an artifact.
+The GitHub Actions workflow installs Gradle 8.7 + Android SDK 35 and uploads the debug APK artifact.
 
-The debug APK will be at:
+APK output:
 
 `app/build/outputs/apk/debug/app-debug.apk`
 
@@ -47,7 +62,7 @@ The debug APK will be at:
 
 - **Clay +**: push the surface outward.
 - **Clay -**: carve inward.
-- **Smooth**: relax nearby vertices toward their neighbours.
+- **Smooth**: relax nearby vertices with reduced shrinkage.
 - **Sym X**: mirror brush strokes across the X axis.
 - **1 finger**: sculpt.
 - **2 fingers drag**: orbit camera.
@@ -56,22 +71,32 @@ The debug APK will be at:
 
 ## Architecture
 
-V1 intentionally uses only the Android SDK and Java:
+V1.1 intentionally remains Android SDK + Java:
 
 - `MainActivity` — touch-first overlay UI
 - `SculptSurfaceView` — gesture routing / GL thread dispatch
-- `SculptRenderer` — camera, OpenGL ES rendering, screen-ray generation, history
-- `SculptMesh` — topology, ray/triangle intersection, brushes, normals
+- `SculptRenderer` — camera, OpenGL ES rendering, ray generation, stroke spacing, history
+- `SculptMesh` — watertight icosphere topology, ray/triangle intersection, connected brush selection, safe deformation, smoothing, normals
 
-This keeps the first prototype easy to audit and easy to run. The next performance step is to move `SculptMesh` operations into a C++17 NDK library with both `armeabi-v7a` and `arm64-v8a` outputs while keeping the Android UI/renderer shell.
+Keeping V1.1 Java-only preserves the current ABI-neutral APK. When the sculpt hot path moves to C++/NDK, build both `armeabi-v7a` and `arm64-v8a`.
 
-## Known V1 limits
+## Validation performed for this patch
 
-- Starts from a sphere only; no OBJ/GLB import/export yet.
-- Fixed topology; no dynamic topology or voxel remeshing.
+The pure Java sculpt core was compiled and smoke-tested outside Android:
+
+- Verified the level-4 icosphere has 2,562 vertices and 5,120 triangles.
+- Verified every undirected edge belongs to exactly two triangles.
+- Verified there are no degenerate starting triangles.
+- Applied 600 mixed Add/Subtract/Smooth brush operations.
+- Verified all positions remained finite and no triangle collapsed to zero area.
+
+## Remaining limits
+
+- Fixed topology; no dynamic topology or voxel remeshing yet.
 - CPU brute-force raycast across all triangles.
-- CPU full normal rebuild after each brush sample.
-- UV-sphere seam is not welded.
+- CPU full normal rebuild after each accepted dab.
+- No OBJ/GLB import/export yet.
 - No masks, layers, materials, alpha brushes, stylus pressure, or autosave yet.
+- The topology safety checks intentionally prefer rejecting an extreme vertex move over allowing an invalid triangle.
 
-Those are deliberate V2+ items rather than unfinished V1 code.
+Dynamic remeshing is the next major geometry step after this stability patch is proven on-device.
