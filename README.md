@@ -1,132 +1,85 @@
-# PocketSculpt V1.3 — Character Blockout
+# PocketSculpt V1.4 — Dynamic Character Sculpt
 
-PocketSculpt is a small Android-native sculpting prototype aimed at character creation on real phones, including 32-bit Android devices. V1.3 changes the target from “deform a sphere safely” to “block out a usable game character.”
+PocketSculpt is a small Android-native sculpting prototype aimed at real character creation on phones, including 32-bit Android devices.
 
-## V1.3 character sculpt patch
+V1.4 adds the major capability V1.3 was missing: **adaptive topology/remeshing**. Clay+, Clay-, Smooth and Grab can now work on geometry that gains detail as the sculpt requires it instead of permanently stretching one fixed triangle layout.
 
-### Character base instead of a bowling ball
+## V1.4 highlights
 
-PocketSculpt now starts from a neutral, watertight humanoid blockout generated locally at startup.
+### Dynamic Topology
 
-- one connected closed surface
-- head, neck, torso, pelvis, arms, hands, legs and feet
-- generated from a smooth implicit field and polygonized with marching tetrahedra
-- approximately 4.2k vertices / 8.4k triangles on the current grid
-- no external model asset required
-- Reset returns to the clean humanoid base
+**DynTopo is enabled by default.** Before a normal sculpt dab, PocketSculpt can adapt the touched region to the current brush detail:
 
-The older watertight icosphere generator remains in the core for regression tests and future primitive workflows.
+- long edges are split locally before deformation,
+- small brushes create finer local triangles,
+- large brushes stay coarser and faster,
+- Smooth may collapse clearly over-dense short edges,
+- X symmetry can refine both sides,
+- topology growth is capped for mobile memory/performance.
 
-### Clay + / Clay -
+The current mobile caps are 48,000 vertices / 96,000 triangles.
 
-Clay is now plane-based rather than generic normal displacement.
+### Remesh
 
-Each dab:
-1. finds a connected front-facing brush region,
-2. computes a weighted average surface normal,
-3. builds a local sculpt plane from the ray hit,
-4. adds or removes volume toward that plane,
-5. blends the rim with a smooth falloff,
-6. commits only when the complete candidate deformation passes the transactional geometry guard.
+The **Remesh** button runs a bounded whole-surface adaptive remesh using the current Size and Detail settings.
 
-This gives broad anatomy-building behavior instead of only making round bumps.
+The pass safely splits long edges and collapses short edges, then verifies the result is still a closed two-manifold before installing it.
 
-### Smooth
+This is an incremental triangle remesher. A separate true voxel remesher can be added later for self-intersection cleanup and volume union workflows.
 
-The previous near-cancelling two-pass Taubin fairing made the Smooth tool feel almost inactive under a finger.
+### Sphere + Human starts
 
-V1.3 Smooth now performs two controlled positive Laplacian relaxations per accepted dab. It intentionally removes local bumps/noise and may shrink the surface slightly, which is expected for a normal sculpt Smooth brush. It still uses the transactional geometry validator.
+Both workflows are available:
 
-### Grab
+- **Sphere** — freeform sculpt-from-a-ball workflow.
+- **Human** — neutral connected humanoid blockout for faster character work.
 
-Grab is now a real brush mode for character proportions.
+Reset returns to whichever pristine base was used to create the current sculpt.
 
-- captures the affected vertices at stroke start
-- drags them in the screen-facing plane
-- keeps the original brush falloff throughout the stroke
-- supports X symmetry
-- runs through the same geometry safety transaction
-- useful for skull shape, jaw width, shoulders, hips, limbs and silhouette changes
+### Core brushes
 
-## Current tools
+- **Clay +** — plane-based volume buildup.
+- **Clay -** — matching volume carve.
+- **Smooth** — visible local relaxation.
+- **Grab** — proportion/silhouette movement.
+- **Sym X** — mirrored character sculpting.
 
-- **Clay +** — build broad volume
-- **Clay -** — carve volume away
-- **Smooth** — visibly relax rough surface
-- **Grab** — move a captured region for proportions/silhouette
-- **Sym X** — mirror sculpting across X
-- adjustable Size / Strength
-- stroke-level Undo / Redo
-- Reset to humanoid base
-- one-finger sculpt
-- two-finger orbit
-- pinch zoom
+Size now reaches a substantially smaller minimum radius for face/detail work, and the Strength range starts lower for finer control.
 
-## Geometry safety
+## Topology-aware undo / redo
 
-V1.2’s transactional guard remains active.
+Topology changes invalidate position-only history. V1.4 snapshots both vertex positions and triangle indices, so Undo/Redo can cross DynTopo and Remesh operations safely.
 
-Brushes do not mutate the live mesh one vertex at a time. Each operation is assembled into a candidate, affected triangles are validated, and the entire operation is either committed at a safe scale or rejected.
+OpenGL buffers are also recreated automatically when vertex/index counts change.
 
-Checks include:
+## Character workflow
 
-- finite coordinates
-- triangle area
-- face orientation changes
-- edge compression/stretch
-- per-step edge change
-- triangle quality
+A practical workflow is now:
 
-The humanoid generator also clamps iso-surface edge interpolation away from exact grid corners to avoid starting with pathological sliver triangles.
+1. Start from **Sphere** for freeform work or **Human** for a faster body blockout.
+2. Leave **DynTopo** enabled.
+3. Use **Grab + Sym X** for silhouette/proportions.
+4. Use large **Clay+ / Clay-** for broad anatomy.
+5. Reduce **Size** and increase **Detail** as you move into the head and smaller forms.
+6. Use **Smooth** to blend noisy transitions.
+7. Tap **Remesh** when you want a more globally even triangle distribution.
+8. Continue refining instead of hitting the old fixed-topology deformation wall.
 
-## Character workflow in V1.3
+## Why this matters
 
-A practical blockout flow is now:
-
-1. Start from the humanoid base.
-2. Use **Grab + Sym X** for overall proportions and silhouette.
-3. Use **Clay +** for skull masses, chest, shoulders, muscle groups and other broad forms.
-4. Use **Clay -** for eye sockets, neck transitions and broad recesses.
-5. Use **Smooth** repeatedly to blend blockout planes and remove unwanted lumps.
-6. Rotate frequently and work from several views.
-
-This is now a character blockout tool, but it is not yet a full ZBrush/Nomad replacement.
-
-## Why dynamic topology is still next
-
-V1.3 deliberately does not fake unlimited free-form sculpting on fixed topology.
-
-For extreme limb pulls, fingers, ears, noses and high-detail anatomy, the mesh eventually needs new topology. The next major geometry milestone remains remeshing/dynamic topology:
-
-1. split long edges,
-2. collapse short edges,
-3. flip edges when triangulation improves,
-4. relax vertices tangentially,
-5. preserve/reproject the sculpted surface.
-
-The existing geometry guard should remain as the final safety layer around those topology edits.
+V1.3 could make a character blockout but fixed topology still imposed a hard deformation budget. V1.4 can create new local geometry before sculpting and remove overly dense geometry during remesh/smoothing. That is the architectural step required before finer anatomy tools such as Crease, Inflate, Flatten and masks become genuinely useful.
 
 ## Build
 
-### Android Studio
-
-1. Open the repository.
-2. Let Gradle sync.
-3. Install Android SDK Platform 35 if requested.
-4. Run the `app` configuration on Android 7.0+.
-
-### GitHub Actions / command line
-
-The workflow uses:
+The project remains Android SDK + Java + OpenGL ES 3.0.
 
 - JDK 17
 - Gradle 8.7
 - Android Gradle Plugin 8.6.1
 - compileSdk / targetSdk 35
+- minSdk 24
 
-Before assembling the APK, CI compiles and runs `tools/SculptCoreSelfTest.java`.
-
-With Gradle 8.7 installed:
+Command line:
 
     gradle assembleDebug
 
@@ -134,52 +87,31 @@ APK:
 
     app/build/outputs/apk/debug/app-debug.apk
 
+GitHub Actions runs the dependency-free sculpt-core tests before building the APK.
+
 ## Android / ABI support
 
-V1.3 is still Java + Android SDK + OpenGL ES 3.0. It contains no native `.so` libraries, so there is currently no native ABI split and the app remains usable on supported 32-bit and 64-bit Android devices.
+V1.4 still contains no native `.so` libraries, so there is no native ABI split yet. The same APK remains usable on supported 32-bit and 64-bit Android devices with OpenGL ES 3.0.
 
-When the hot path later moves to the NDK, ship both:
+When the sculpt hot path later moves to the NDK, build both:
 
 - `armeabi-v7a`
 - `arm64-v8a`
 
-## V1.3 automated validation
+## Automated validation
 
-The dependency-free sculpt-core test now checks:
+The V1.4 core test covers:
 
-- watertight icosphere regression path
-- humanoid base generation
-- humanoid vertex/triangle mobile budget
-- closed two-manifold topology
-- one connected humanoid surface
-- healthy starting geometry
-- Clay + produces outward volume
-- Clay - produces inward carving
-- Smooth produces measurable movement and reduces Laplacian roughness
-- Grab produces useful proportion movement
-- mixed character brush stress remains healthy
-- post-stress ray picking still works
+- watertight icosphere regression,
+- watertight connected humanoid base,
+- Clay+ / Clay- direction,
+- useful Smooth behavior,
+- Grab proportion edits,
+- local DynTopo edge refinement,
+- sculpting after topology changes,
+- global adaptive Remesh,
+- topology-aware state restore,
+- mixed character + DynTopo stress,
+- manifold and finite-coordinate checks throughout.
 
-Android-facing Java is also syntax/signature checked during development against API stubs when the Android SDK is unavailable in the patching environment.
-
-## Remaining limits
-
-- no dynamic topology / voxel remesh yet
-- fixed topology still imposes a hard deformation budget
-- CPU brute-force raycast over the current triangles
-- CPU full normal rebuild after accepted brush operations
-- no masks / layers / crease / inflate / flatten yet
-- no OBJ/GLB import/export yet
-- no stylus pressure yet
-- no persistent autosave after process death yet
-
-## Research direction
-
-V1.3 follows the same broad sculpting concepts documented by established tools:
-
-- Blender’s common sculpt workflow uses Clay Strips for broad volume, Grab for proportions, Smooth for cleanup, and Draw for generic add/subtract.
-- Blender describes Grab as an essential shape/proportion brush.
-- Nomad recommends voxel remeshing or dynamic topology when stretched polygons need fresh density.
-- Isotropic remeshing literature and CGAL’s implementation use split → collapse → flip → relax → reproject.
-
-See `docs/CHARACTER_SCULPT_AUDIT_V1_3.md` for the detailed audit.
+See `docs/DYNAMIC_TOPOLOGY_AUDIT_V1_4.md` for implementation details and remaining remeshing work.

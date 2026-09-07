@@ -16,12 +16,15 @@ public final class SculptCoreSelfTest {
 
         testIcosphereGuard();
         testHumanBase();
+        testDynamicTopologyRefinement();
+        testUniformRemeshAndTopologyUndoState();
         testClayDirections();
         testSmoothActuallySmooths();
         testGrabForProportions();
+        stressDynamicCharacterCore();
         stressCharacterCore();
 
-        System.out.println("PocketSculpt V1.3 character sculpt self-test passed.");
+        System.out.println("PocketSculpt V1.4 dynamic-topology sculpt self-test passed.");
     }
 
     private static void testIcosphereGuard() {
@@ -56,6 +59,65 @@ public final class SculptCoreSelfTest {
         require(bounds[3] - bounds[0] > 1.25f, "human base is too narrow to contain arms");
         require(bounds[4] - bounds[1] > 2.65f, "human base is too short");
         require(bounds[5] - bounds[2] > 0.45f, "human base lost body depth");
+    }
+
+    private static void testDynamicTopologyRefinement() {
+        SculptMesh mesh = SculptMesh.createIcoSphere(2, 1f);
+        int beforeVertices = mesh.vertexCount();
+        int beforeTriangles = mesh.triangleCount();
+        long beforeVersion = mesh.topologyVersion();
+
+        SculptMesh.Hit hit = mesh.raycast(
+                new float[]{0f, 0f, 4f},
+                new float[]{0f, 0f, -1f}
+        );
+        require(hit != null, "could not ray-pick sphere for Dyntopo refinement");
+
+        boolean changed = mesh.remeshBrushRegion(
+                hit.x, hit.y, hit.z,
+                0.52f,
+                0.075f,
+                72,
+                false
+        );
+        require(changed, "dynamic refinement did not split long edges");
+        require(mesh.vertexCount() > beforeVertices, "Dyntopo did not add vertices");
+        require(mesh.triangleCount() > beforeTriangles, "Dyntopo did not add triangles");
+        require(mesh.topologyVersion() > beforeVersion, "topology version did not advance");
+        require(mesh.isClosedTwoManifold(), "Dyntopo split broke manifold topology");
+        require(mesh.isHealthy(), "Dyntopo split produced unhealthy geometry");
+
+        hit = mesh.raycast(new float[]{0f, 0f, 4f}, new float[]{0f, 0f, -1f});
+        require(hit != null, "raycast failed after Dyntopo refinement");
+        boolean sculpted = mesh.applyBrush(
+                hit.x, hit.y, hit.z,
+                hit.nx, hit.ny, hit.nz,
+                new float[]{0f, 0f, -1f},
+                0.20f, 0.028f,
+                BrushMode.ADD, true
+        );
+        mesh.recalculateNormals();
+        require(sculpted, "Clay+ failed after Dyntopo refinement");
+        require(mesh.isHealthy(), "sculpt after Dyntopo refinement became unhealthy");
+    }
+
+    private static void testUniformRemeshAndTopologyUndoState() {
+        SculptMesh mesh = SculptMesh.createHumanBase();
+        SculptMesh.MeshState original = mesh.captureState();
+        int originalVertices = mesh.vertexCount();
+
+        boolean changed = mesh.remeshUniform(0.075f, 220);
+        require(changed, "uniform remesh made no topology change");
+        require(mesh.isClosedTwoManifold(), "uniform remesh broke manifold topology");
+        require(mesh.isHealthy(), "uniform remesh produced unhealthy geometry");
+        require(mesh.vertexCount() != originalVertices || mesh.triangleCount() != original.indices.length / 3,
+                "uniform remesh left topology unchanged");
+
+        require(mesh.restoreState(original), "topology-aware state restore failed");
+        require(mesh.vertexCount() == original.positions.length / 3, "state restore vertex count mismatch");
+        require(mesh.triangleCount() == original.indices.length / 3, "state restore triangle count mismatch");
+        require(mesh.isClosedTwoManifold(), "state restore lost manifold topology");
+        require(mesh.isHealthy(), "state restore produced unhealthy mesh");
     }
 
     private static void testClayDirections() {
@@ -163,6 +225,56 @@ public final class SculptCoreSelfTest {
         require(maxAxisDelta(before, mesh.positions, 0) > 0.01f,
                 "Grab did not move geometry across the screen/world X axis");
         require(mesh.isHealthy(), "Grab violated geometry health");
+    }
+
+    private static void stressDynamicCharacterCore() {
+        SculptMesh mesh = SculptMesh.createHumanBase();
+        Random random = new Random(0xD17A0B0L);
+        int startVertices = mesh.vertexCount();
+
+        for (int i = 0; i < 220; i++) {
+            float x = -0.52f + random.nextFloat() * 1.04f;
+            float y = -1.05f + random.nextFloat() * 2.20f;
+            SculptMesh.Hit hit = frontHit(mesh, x, y);
+            if (hit == null) continue;
+
+            float radius = 0.12f + random.nextFloat() * 0.20f;
+            float targetEdge = Math.max(0.025f, Math.min(0.10f, radius * 0.22f));
+            boolean smooth = i % 9 == 0;
+            mesh.remeshBrushRegion(
+                    hit.x, hit.y, hit.z,
+                    radius,
+                    targetEdge,
+                    smooth ? 14 : 10,
+                    smooth
+            );
+            hit = frontHit(mesh, x, y);
+            if (hit == null) continue;
+
+            BrushMode mode = smooth ? BrushMode.SMOOTH : ((i & 1) == 0 ? BrushMode.ADD : BrushMode.SUBTRACT);
+            mesh.applyBrush(
+                    hit.x, hit.y, hit.z,
+                    hit.nx, hit.ny, hit.nz,
+                    new float[]{0f, 0f, -1f},
+                    radius,
+                    0.016f + random.nextFloat() * 0.025f,
+                    mode,
+                    true
+            );
+            mesh.recalculateNormals();
+
+            if ((i + 1) % 40 == 0) {
+                require(mesh.isClosedTwoManifold(), "DynTopo stress broke manifold topology");
+                require(mesh.isHealthy(), "DynTopo stress violated geometry health");
+                require(allFinite(mesh.positions), "DynTopo stress created non-finite coordinates");
+            }
+        }
+
+        require(mesh.vertexCount() >= startVertices, "DynTopo unexpectedly lost the character mesh");
+        require(mesh.vertexCount() < 48000, "DynTopo exceeded the mobile vertex budget");
+        require(mesh.triangleCount() < 96000, "DynTopo exceeded the mobile triangle budget");
+        require(mesh.isClosedTwoManifold(), "DynTopo final mesh is not manifold");
+        require(mesh.isHealthy(), "DynTopo final mesh is unhealthy");
     }
 
     private static void stressCharacterCore() {

@@ -33,5 +33,5 @@ jobs:
         run: gradle assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: PocketSculpt-v1.3-debug
+          name: PocketSculpt-v1.4-debug
           path: app/build/outputs/apk/debug/app-debug.apk

@@ -38,6 +38,29 @@ public class SculptSurfaceView extends GLSurfaceView {
         return renderer.toggleSymmetry();
     }
 
+    public boolean toggleDynamicTopology() {
+        return renderer.toggleDynamicTopology();
+    }
+
+    public void setTopologyDetail(float detail) {
+        renderer.setTopologyDetail(detail);
+    }
+
+    public void remeshNow() {
+        queueEvent(renderer::remeshNow);
+        requestRender();
+    }
+
+    public void newSphere() {
+        queueEvent(renderer::newSphere);
+        requestRender();
+    }
+
+    public void newHuman() {
+        queueEvent(renderer::newHuman);
+        requestRender();
+    }
+
     public void undo() {
         queueEvent(renderer::undo);
         requestRender();

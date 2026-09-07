@@ -43,6 +43,9 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
     private volatile float brushRadius = 0.327f;
     private volatile float brushStrength = 0.0263f;
     private volatile boolean symmetryX = false;
+    private volatile boolean dynamicTopology = true;
+    // Detail is brush-relative: lower values create finer triangles.
+    private volatile float topologyDetail = 0.22f;
 
     private float yaw = 22f;
     private float pitch = 8f;
@@ -53,15 +56,16 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
     private boolean hasLastDab = false;
     private float lastDabX;
     private float lastDabY;
-    private float[] strokeStartSnapshot;
+    private SculptMesh.MeshState strokeStartSnapshot;
     private SculptMesh.GrabHandle grabHandle;
     private SculptMesh.GrabHandle mirroredGrabHandle;
     private final float[] grabPlanePoint = new float[3];
     private final float[] grabPlaneNormal = new float[3];
     private final float[] grabStartWorld = new float[3];
     private boolean grabReady = false;
-    private final Deque<float[]> undoStack = new ArrayDeque<>();
-    private final Deque<float[]> redoStack = new ArrayDeque<>();
+    private final Deque<SculptMesh.MeshState> undoStack = new ArrayDeque<>();
+    private final Deque<SculptMesh.MeshState> redoStack = new ArrayDeque<>();
+    private long bufferedTopologyVersion = -1L;
 
     @Override
     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
@@ -139,12 +143,59 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         return symmetryX;
     }
 
+    public boolean toggleDynamicTopology() {
+        dynamicTopology = !dynamicTopology;
+        return dynamicTopology;
+    }
+
+    public void setTopologyDetail(float detail) {
+        topologyDetail = Math.max(0.12f, Math.min(0.40f, detail));
+    }
+
+    public void remeshNow() {
+        if (mesh == null || strokeActive) return;
+        SculptMesh.MeshState before = mesh.captureState();
+        float targetEdge = currentTargetEdgeLength();
+        if (mesh.remeshUniform(targetEdge, 420)) {
+            undoStack.push(before);
+            trimHistory(undoStack);
+            redoStack.clear();
+            buffersDirty = true;
+        }
+    }
+
+    public void newSphere() {
+        replaceMesh(SculptMesh.createIcoSphere(3, 1.0f), 4.1f);
+    }
+
+    public void newHuman() {
+        replaceMesh(SculptMesh.createHumanBase(), 5.25f);
+    }
+
+    private void replaceMesh(SculptMesh replacement, float distance) {
+        if (replacement == null) return;
+        mesh = replacement;
+        cameraDistance = distance;
+        hasLastDab = false;
+        strokeActive = false;
+        clearGrabState();
+        undoStack.clear();
+        redoStack.clear();
+        strokeStartSnapshot = null;
+        bufferedTopologyVersion = -1L;
+        buffersDirty = true;
+    }
+
+    private float currentTargetEdgeLength() {
+        return Math.max(0.020f, Math.min(0.16f, brushRadius * topologyDetail));
+    }
+
     public void beginStroke() {
         if (mesh == null || strokeActive) return;
         strokeActive = true;
         hasLastDab = false;
         clearGrabState();
-        strokeStartSnapshot = mesh.copyPositions();
+        strokeStartSnapshot = mesh.captureState();
     }
 
     public void endStroke() {
@@ -155,7 +206,7 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         strokeActive = false;
         hasLastDab = false;
         clearGrabState();
-        if (strokeStartSnapshot != null && !samePositions(strokeStartSnapshot, mesh.positions)) {
+        if (strokeStartSnapshot != null && !sameState(strokeStartSnapshot, mesh)) {
             undoStack.push(strokeStartSnapshot);
             trimHistory(undoStack);
             redoStack.clear();
@@ -217,6 +268,30 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         if (!grabReady) {
             SculptMesh.Hit hit = mesh.raycast(ray.origin, ray.direction);
             if (hit == null) return false;
+
+            if (dynamicTopology) {
+                boolean topologyChanged = mesh.remeshBrushRegion(
+                        hit.x, hit.y, hit.z,
+                        brushRadius,
+                        currentTargetEdgeLength(),
+                        20,
+                        false
+                );
+                if (symmetryX && Math.abs(hit.x) * 2f >= brushRadius * 0.75f) {
+                    topologyChanged |= mesh.remeshBrushRegion(
+                            -hit.x, hit.y, hit.z,
+                            brushRadius,
+                            currentTargetEdgeLength(),
+                            20,
+                            false
+                    );
+                }
+                if (topologyChanged) {
+                    buffersDirty = true;
+                    hit = mesh.raycast(ray.origin, ray.direction);
+                    if (hit == null) return false;
+                }
+            }
 
             grabHandle = mesh.beginGrab(
                     hit.x, hit.y, hit.z,
@@ -306,11 +381,34 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         SculptMesh.Hit hit = mesh.raycast(ray.origin, ray.direction);
         if (hit == null) return false;
 
+        if (dynamicTopology) {
+            boolean allowCollapse = brushMode == BrushMode.SMOOTH;
+            boolean topologyChanged = mesh.remeshBrushRegion(
+                    hit.x, hit.y, hit.z,
+                    brushRadius,
+                    currentTargetEdgeLength(),
+                    allowCollapse ? 18 : 14,
+                    allowCollapse
+            );
+            if (symmetryX && Math.abs(hit.x) * 2f >= brushRadius * 0.70f) {
+                topologyChanged |= mesh.remeshBrushRegion(
+                        -hit.x, hit.y, hit.z,
+                        brushRadius,
+                        currentTargetEdgeLength(),
+                        allowCollapse ? 18 : 14,
+                        allowCollapse
+                );
+            }
+            if (topologyChanged) {
+                buffersDirty = true;
+                hit = mesh.raycast(ray.origin, ray.direction);
+                if (hit == null) return false;
+            }
+        }
+
         float effectiveStrength = brushStrength;
         float mirroredSeparation = Math.abs(hit.x) * 2f;
         if (symmetryX && mirroredSeparation < brushRadius * 2f) {
-            // When the two symmetry brushes overlap, reduce each contribution so
-            // the center seam does not receive an accidental double-strength hit.
             float overlap = 1f - mirroredSeparation / Math.max(1e-6f, brushRadius * 2f);
             effectiveStrength = brushStrength / (1f + overlap);
         }
@@ -326,12 +424,7 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         );
 
         if (symmetryX) {
-            if (changed) {
-                // The mirrored selection relies on current normals. Refresh them
-                // after the primary transaction instead of using stale pre-dab data.
-                mesh.recalculateNormals();
-            }
-
+            if (changed) mesh.recalculateNormals();
             float[] mirroredView = new float[]{
                     -ray.direction[0],
                     ray.direction[1],
@@ -353,8 +446,6 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
             mesh.recalculateNormals();
             buffersDirty = true;
         }
-        // A valid ray hit still counts as a consumed dab even if the geometry
-        // guard rejected movement because the fixed topology reached its limit.
         return true;
     }
 
@@ -379,35 +470,37 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
     public void undo() {
         if (mesh == null || undoStack.isEmpty()) return;
         hasLastDab = false;
-        redoStack.push(mesh.copyPositions());
+        redoStack.push(mesh.captureState());
         trimHistory(redoStack);
-        mesh.setPositions(undoStack.pop());
-        mesh.recalculateNormals();
-        buffersDirty = true;
+        if (mesh.restoreState(undoStack.pop())) {
+            buffersDirty = true;
+            bufferedTopologyVersion = -1L;
+        }
     }
 
     public void redo() {
         if (mesh == null || redoStack.isEmpty()) return;
         hasLastDab = false;
-        undoStack.push(mesh.copyPositions());
+        undoStack.push(mesh.captureState());
         trimHistory(undoStack);
-        mesh.setPositions(redoStack.pop());
-        mesh.recalculateNormals();
-        buffersDirty = true;
+        if (mesh.restoreState(redoStack.pop())) {
+            buffersDirty = true;
+            bufferedTopologyVersion = -1L;
+        }
     }
 
     public void resetMesh() {
         if (mesh == null) return;
-        float[] before = mesh.copyPositions();
+        SculptMesh.MeshState before = mesh.captureState();
         mesh.reset();
-        if (samePositions(before, mesh.positions)) return;
+        if (sameState(before, mesh)) return;
 
         hasLastDab = false;
         undoStack.push(before);
         trimHistory(undoStack);
         redoStack.clear();
-        mesh.recalculateNormals();
         buffersDirty = true;
+        bufferedTopologyVersion = -1L;
     }
 
     private void updateMatrices() {
@@ -465,26 +558,41 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
                 .order(ByteOrder.nativeOrder()).asFloatBuffer();
         indexBuffer = ByteBuffer.allocateDirect(mesh.indices.length * 4)
                 .order(ByteOrder.nativeOrder()).asIntBuffer();
-        indexBuffer.put(mesh.indices).position(0);
+        bufferedTopologyVersion = mesh.topologyVersion();
         uploadMesh();
     }
 
     private void uploadMesh() {
+        if (positionBuffer == null || normalBuffer == null || indexBuffer == null
+                || positionBuffer.capacity() != mesh.positions.length
+                || normalBuffer.capacity() != mesh.normals.length
+                || indexBuffer.capacity() != mesh.indices.length
+                || bufferedTopologyVersion != mesh.topologyVersion()) {
+            allocateBuffers();
+            return;
+        }
         positionBuffer.position(0);
         positionBuffer.put(mesh.positions).position(0);
         normalBuffer.position(0);
         normalBuffer.put(mesh.normals).position(0);
+        indexBuffer.position(0);
+        indexBuffer.put(mesh.indices).position(0);
         buffersDirty = false;
     }
 
-    private void trimHistory(Deque<float[]> stack) {
+    private void trimHistory(Deque<SculptMesh.MeshState> stack) {
         while (stack.size() > MAX_HISTORY) stack.removeLast();
     }
 
-    private boolean samePositions(float[] a, float[] b) {
-        if (a.length != b.length) return false;
-        for (int i = 0; i < a.length; i++) {
-            if (Math.abs(a[i] - b[i]) > 1e-7f) return false;
+    private boolean sameState(SculptMesh.MeshState state, SculptMesh current) {
+        if (state == null || current == null) return false;
+        if (state.positions.length != current.positions.length
+                || state.indices.length != current.indices.length) return false;
+        for (int i = 0; i < state.indices.length; i++) {
+            if (state.indices[i] != current.indices[i]) return false;
+        }
+        for (int i = 0; i < state.positions.length; i++) {
+            if (Math.abs(state.positions[i] - current.positions[i]) > 1e-7f) return false;
         }
         return true;
     }

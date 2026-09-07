@@ -9,38 +9,41 @@ import java.util.Map;
 import java.util.Set;
 
 final class SculptMesh {
-    final float[] positions;
-    final float[] normals;
-    final int[] indices;
+    float[] positions;
+    float[] normals;
+    int[] indices;
 
-    // Fixed-topology guard rails. These deliberately trade extreme deformation
-    // for a mesh that remains usable until dynamic remeshing is implemented.
+    // Runtime topology is intentionally mutable from V1.4 onward. The reset
+    // mesh is kept separately so Remesh/DynTopo can rebuild connectivity while
+    // Reset still returns to the chosen pristine primitive/base.
     private static final float MAX_EDGE_STRETCH = 2.35f;
     private static final float MIN_EDGE_COMPRESSION = 0.38f;
     private static final float MIN_REST_AREA_RATIO = 0.16f;
     private static final float MIN_STEP_AREA_RATIO = 0.52f;
     private static final float MIN_STEP_NORMAL_DOT = 0.32f;
-    private static final float MIN_TRIANGLE_QUALITY = 0.10f;
+    private static final float MIN_TRIANGLE_QUALITY = 0.07f;
     private static final float MAX_STEP_EDGE_GROWTH = 1.28f;
     private static final float MIN_STEP_EDGE_SHRINK = 0.76f;
     private static final int MAX_LINE_SEARCH_STEPS = 7;
 
-    private final float[] originalPositions;
-    private final int[][] neighbors;
-    private final int[][] incidentTriangles;
-    private final float[] restTriangleArea2;
+    private final float[] resetPositions;
+    private final int[] resetIndices;
+    private float[] restPositions;
+    private int[][] neighbors;
+    private int[][] incidentTriangles;
+    private float[] restTriangleArea2;
 
-    // Reused transaction buffers keep the safety pass from creating several
-    // full-mesh garbage objects for every brush dab on low-memory phones.
-    private final float[] beforeScratch;
-    private final float[] candidateScratch;
-    private final float[] deltaScratch;
-    private final boolean[] touchedTriangleMask;
-    private final int[] touchedTriangles;
-    private final int[] traversalStamp;
-    private final int[] traversalQueue;
-    private final int[] selectionVerticesScratch;
-    private final float[] selectionWeightsScratch;
+    // Reused transaction buffers are rebuilt only when topology changes.
+    private float[] beforeScratch;
+    private float[] candidateScratch;
+    private float[] deltaScratch;
+    private boolean[] touchedTriangleMask;
+    private int[] touchedTriangles;
+    private int[] traversalStamp;
+    private int[] traversalQueue;
+    private int[] selectionVerticesScratch;
+    private float[] selectionWeightsScratch;
+    private long topologyVersion = 1L;
     private final float[] normalScratchOld = new float[3];
     private final float[] normalScratchNew = new float[3];
     private int traversalGeneration = 1;
@@ -76,29 +79,77 @@ final class SculptMesh {
     }
 
     private SculptMesh(float[] positions, int[] indices) {
-        this.positions = positions;
-        this.originalPositions = positions.clone();
-        this.indices = indices;
-        this.normals = new float[positions.length];
-        this.neighbors = buildNeighbors(positions.length / 3, indices);
-        this.incidentTriangles = buildIncidentTriangles(positions.length / 3, indices);
-        this.restTriangleArea2 = new float[indices.length / 3];
+        this.resetPositions = positions.clone();
+        this.resetIndices = indices.clone();
+        installTopology(positions.clone(), indices.clone(), true);
+    }
 
-        this.beforeScratch = new float[positions.length];
-        this.candidateScratch = new float[positions.length];
-        this.deltaScratch = new float[positions.length];
-        this.touchedTriangleMask = new boolean[indices.length / 3];
-        this.touchedTriangles = new int[indices.length / 3];
-        int vertexCount = positions.length / 3;
+    static final class MeshState {
+        final float[] positions;
+        final int[] indices;
+
+        MeshState(float[] positions, int[] indices) {
+            this.positions = positions;
+            this.indices = indices;
+        }
+    }
+
+    MeshState captureState() {
+        return new MeshState(positions.clone(), indices.clone());
+    }
+
+    boolean restoreState(MeshState state) {
+        if (state == null || state.positions == null || state.indices == null) return false;
+        if (state.positions.length < 9 || state.positions.length % 3 != 0
+                || state.indices.length < 3 || state.indices.length % 3 != 0) return false;
+        for (float value : state.positions) if (!Float.isFinite(value)) return false;
+        int vertexCount = state.positions.length / 3;
+        for (int index : state.indices) if (index < 0 || index >= vertexCount) return false;
+        installTopology(state.positions.clone(), state.indices.clone(), true);
+        return true;
+    }
+
+    long topologyVersion() {
+        return topologyVersion;
+    }
+
+    int vertexCount() {
+        return positions.length / 3;
+    }
+
+    int triangleCount() {
+        return indices.length / 3;
+    }
+
+    private void installTopology(float[] newPositions, int[] newIndices, boolean resetRest) {
+        this.positions = newPositions;
+        this.indices = newIndices;
+        this.normals = new float[newPositions.length];
+        this.neighbors = buildNeighbors(newPositions.length / 3, newIndices);
+        this.incidentTriangles = buildIncidentTriangles(newPositions.length / 3, newIndices);
+
+        if (resetRest || restPositions == null || restPositions.length != newPositions.length) {
+            this.restPositions = newPositions.clone();
+        }
+        this.restTriangleArea2 = new float[newIndices.length / 3];
+
+        this.beforeScratch = new float[newPositions.length];
+        this.candidateScratch = new float[newPositions.length];
+        this.deltaScratch = new float[newPositions.length];
+        this.touchedTriangleMask = new boolean[newIndices.length / 3];
+        this.touchedTriangles = new int[newIndices.length / 3];
+        int vertexCount = newPositions.length / 3;
         this.traversalStamp = new int[vertexCount];
         this.traversalQueue = new int[vertexCount];
         this.selectionVerticesScratch = new int[vertexCount];
         this.selectionWeightsScratch = new float[vertexCount];
+        this.traversalGeneration = 1;
 
         for (int triangle = 0; triangle < restTriangleArea2.length; triangle++) {
-            restTriangleArea2[triangle] = triangleArea2(originalPositions, triangle);
+            restTriangleArea2[triangle] = triangleArea2(restPositions, triangle);
         }
         recalculateNormals();
+        topologyVersion++;
     }
 
     static SculptMesh createIcoSphere(int subdivisions, float radius) {
@@ -340,7 +391,7 @@ final class SculptMesh {
             float amount = raw * w * (0.35f + 0.65f * w);
 
             float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
-            float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
+            float restEdge = minNeighborEdgeLengthFrom(restPositions, vertex);
             float maxMove = Math.max(
                     0.00035f,
                     Math.min(currentEdge * 0.12f, restEdge * 0.16f)
@@ -415,7 +466,7 @@ final class SculptMesh {
             float moveZ = targetZ - beforeScratch[base + 2];
 
             float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
-            float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
+            float restEdge = minNeighborEdgeLengthFrom(restPositions, vertex);
             float maxMove = Math.max(
                     0.0005f,
                     Math.min(currentEdge * 0.22f, restEdge * 0.30f)
@@ -489,6 +540,603 @@ final class SculptMesh {
             }
         }
         return new float[]{nx, ny, nz};
+    }
+
+
+    // --- V1.4 adaptive triangle remeshing ---------------------------------
+    // This is deliberately an incremental surface remesher rather than a
+    // voxelizer. Long edges are split before sculpting so small brushes gain
+    // real geometry; short edges can be collapsed to keep density bounded.
+    // Every topology edit is assembled off-mesh and only installed if the
+    // result remains a closed two-manifold.
+    private static final int MAX_DYNAMIC_VERTICES = 48_000;
+    private static final int MAX_DYNAMIC_TRIANGLES = 96_000;
+
+    boolean remeshBrushRegion(
+            float cx, float cy, float cz,
+            float radius,
+            float targetEdge,
+            int operationBudget,
+            boolean allowCollapse
+    ) {
+        if (!allFinite(cx, cy, cz, radius, targetEdge)) return false;
+        if (!(radius > 0f) || !(targetEdge > 0f) || operationBudget <= 0) return false;
+        return remeshAdaptive(
+                cx, cy, cz,
+                radius * 1.18f,
+                clamp(targetEdge, 0.018f, 0.24f),
+                Math.min(48, operationBudget),
+                allowCollapse,
+                true
+        );
+    }
+
+    boolean remeshUniform(float targetEdge, int operationBudget) {
+        if (!(targetEdge > 0f) || !Float.isFinite(targetEdge) || operationBudget <= 0) return false;
+        return remeshAdaptive(
+                0f, 0f, 0f,
+                Float.POSITIVE_INFINITY,
+                clamp(targetEdge, 0.018f, 0.24f),
+                Math.min(900, operationBudget),
+                true,
+                false
+        );
+    }
+
+    private boolean remeshAdaptive(
+            float cx, float cy, float cz,
+            float regionRadius,
+            float targetEdge,
+            int operationBudget,
+            boolean allowCollapse,
+            boolean local
+    ) {
+        MutableTopology mutable = MutableTopology.fromArrays(positions, indices);
+        int remaining = operationBudget;
+        int changed = 0;
+
+        // Split first. Refinement runs before the sculpt dab so a small brush
+        // never has to pull one huge triangle into a character feature. Batch
+        // non-overlapping edge splits from one edge map to keep this usable on
+        // 32-bit phones instead of rebuilding the full edge map per split.
+        int splitCount = splitLongEdgesBatched(
+                mutable,
+                cx, cy, cz,
+                regionRadius,
+                targetEdge * 1.34f,
+                remaining,
+                local
+        );
+        changed += splitCount;
+        remaining -= splitCount;
+
+        // Collapse only clearly over-dense edges. The link-condition check in
+        // collapseEdge prevents non-manifold pinches and duplicate local fans.
+        if (allowCollapse) {
+            int collapseBudget = Math.max(1, operationBudget / 3);
+            while (remaining > 0 && collapseBudget-- > 0) {
+                EdgeRecord edge = findShortestEdge(
+                        mutable, cx, cy, cz, regionRadius,
+                        targetEdge * 0.58f, local
+                );
+                if (edge == null) break;
+                if (collapseEdge(mutable, edge)) {
+                    changed++;
+                    remaining--;
+                } else {
+                    edge.blocked = true;
+                    if (!hasCollapsibleShortEdge(
+                            mutable, cx, cy, cz, regionRadius,
+                            targetEdge * 0.58f, local, edge.key
+                    )) break;
+                    // Avoid getting stuck selecting the same rejected edge.
+                    if (!collapseFirstOtherShortEdge(
+                            mutable, cx, cy, cz, regionRadius,
+                            targetEdge * 0.58f, local, edge.key
+                    )) break;
+                    changed++;
+                    remaining--;
+                }
+            }
+        }
+
+        if (changed == 0) return false;
+
+        MeshArrays compact = mutable.compact();
+        if (compact.positions.length / 3 > MAX_DYNAMIC_VERTICES
+                || compact.indices.length / 3 > MAX_DYNAMIC_TRIANGLES) return false;
+        if (!closedTwoManifold(compact.indices)) return false;
+        if (!allFiniteArray(compact.positions)) return false;
+
+        float[] oldPositions = positions.clone();
+        int[] oldIndices = indices.clone();
+        installTopology(compact.positions, compact.indices, true);
+        if (!isHealthy() || !isClosedTwoManifold()) {
+            installTopology(oldPositions, oldIndices, true);
+            return false;
+        }
+        return true;
+    }
+
+    private static int splitLongEdgesBatched(
+            MutableTopology mesh,
+            float cx, float cy, float cz,
+            float radius,
+            float threshold,
+            int budget,
+            boolean local
+    ) {
+        int total = 0;
+        int passes = 0;
+        while (budget > 0
+                && passes++ < 4
+                && mesh.vertices.size() < MAX_DYNAMIC_VERTICES
+                && mesh.faces.size() < MAX_DYNAMIC_TRIANGLES) {
+            Map<Long, EdgeRecord> edges = buildEdgeRecords(mesh.faces);
+            List<EdgeCandidate> candidates = new ArrayList<>();
+            for (EdgeRecord edge : edges.values()) {
+                if (edge.count != 2) continue;
+                float[] a = mesh.vertices.get(edge.a);
+                float[] b = mesh.vertices.get(edge.b);
+                if (a == null || b == null) continue;
+                float mx = (a[0] + b[0]) * 0.5f;
+                float my = (a[1] + b[1]) * 0.5f;
+                float mz = (a[2] + b[2]) * 0.5f;
+                if (local && distanceSq(mx, my, mz, cx, cy, cz) > radius * radius) continue;
+                float len = length(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+                if (len > threshold) candidates.add(new EdgeCandidate(edge, len));
+            }
+            if (candidates.isEmpty()) break;
+            candidates.sort((left, right) -> Float.compare(right.length, left.length));
+
+            int faceCountAtPassStart = mesh.faces.size();
+            boolean[] usedFace = new boolean[faceCountAtPassStart];
+            int passChanges = 0;
+            for (EdgeCandidate candidate : candidates) {
+                if (budget <= 0
+                        || mesh.vertices.size() >= MAX_DYNAMIC_VERTICES
+                        || mesh.faces.size() >= MAX_DYNAMIC_TRIANGLES) break;
+                EdgeRecord edge = candidate.edge;
+                if (edge.face0 < 0 || edge.face1 < 0
+                        || edge.face0 >= faceCountAtPassStart
+                        || edge.face1 >= faceCountAtPassStart) continue;
+                if (usedFace[edge.face0] || usedFace[edge.face1]) continue;
+                if (splitEdge(mesh, edge)) {
+                    usedFace[edge.face0] = true;
+                    usedFace[edge.face1] = true;
+                    total++;
+                    passChanges++;
+                    budget--;
+                }
+            }
+            if (passChanges == 0) break;
+        }
+        return total;
+    }
+
+    private static EdgeRecord findLongestEdge(
+            MutableTopology mesh,
+            float cx, float cy, float cz,
+            float radius,
+            float threshold,
+            boolean local
+    ) {
+        Map<Long, EdgeRecord> edges = buildEdgeRecords(mesh.faces);
+        EdgeRecord best = null;
+        float bestLength = threshold;
+        for (EdgeRecord edge : edges.values()) {
+            if (edge.count != 2) continue;
+            float[] a = mesh.vertices.get(edge.a);
+            float[] b = mesh.vertices.get(edge.b);
+            if (a == null || b == null) continue;
+            float mx = (a[0] + b[0]) * 0.5f;
+            float my = (a[1] + b[1]) * 0.5f;
+            float mz = (a[2] + b[2]) * 0.5f;
+            if (local && distanceSq(mx, my, mz, cx, cy, cz) > radius * radius) continue;
+            float length = length(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+            if (length > bestLength) {
+                bestLength = length;
+                best = edge;
+            }
+        }
+        return best;
+    }
+
+    private static EdgeRecord findShortestEdge(
+            MutableTopology mesh,
+            float cx, float cy, float cz,
+            float radius,
+            float threshold,
+            boolean local
+    ) {
+        Map<Long, EdgeRecord> edges = buildEdgeRecords(mesh.faces);
+        EdgeRecord best = null;
+        float bestLength = threshold;
+        for (EdgeRecord edge : edges.values()) {
+            if (edge.count != 2) continue;
+            float[] a = mesh.vertices.get(edge.a);
+            float[] b = mesh.vertices.get(edge.b);
+            if (a == null || b == null) continue;
+            float mx = (a[0] + b[0]) * 0.5f;
+            float my = (a[1] + b[1]) * 0.5f;
+            float mz = (a[2] + b[2]) * 0.5f;
+            if (local && distanceSq(mx, my, mz, cx, cy, cz) > radius * radius) continue;
+            float len = length(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+            if (len < bestLength) {
+                bestLength = len;
+                best = edge;
+            }
+        }
+        return best;
+    }
+
+    private static boolean splitEdge(MutableTopology mesh, EdgeRecord edge) {
+        if (edge == null || edge.count != 2) return false;
+        if (edge.face0 < 0 || edge.face1 < 0) return false;
+        float[] a = mesh.vertices.get(edge.a);
+        float[] b = mesh.vertices.get(edge.b);
+        if (a == null || b == null) return false;
+
+        int midpoint = mesh.vertices.size();
+        mesh.vertices.add(new float[]{
+                (a[0] + b[0]) * 0.5f,
+                (a[1] + b[1]) * 0.5f,
+                (a[2] + b[2]) * 0.5f
+        });
+
+        int[] f0 = mesh.faces.get(edge.face0);
+        int[] f1 = mesh.faces.get(edge.face1);
+        int[][] s0 = splitFace(f0, edge.a, edge.b, midpoint);
+        int[][] s1 = splitFace(f1, edge.a, edge.b, midpoint);
+        if (s0 == null || s1 == null) {
+            mesh.vertices.remove(mesh.vertices.size() - 1);
+            return false;
+        }
+
+        mesh.faces.set(edge.face0, s0[0]);
+        mesh.faces.set(edge.face1, s1[0]);
+        mesh.faces.add(s0[1]);
+        mesh.faces.add(s1[1]);
+        return true;
+    }
+
+    private static int[][] splitFace(int[] face, int a, int b, int midpoint) {
+        for (int i = 0; i < 3; i++) {
+            int u = face[i];
+            int v = face[(i + 1) % 3];
+            int w = face[(i + 2) % 3];
+            if (u == a && v == b) {
+                return new int[][]{
+                        {a, midpoint, w},
+                        {midpoint, b, w}
+                };
+            }
+            if (u == b && v == a) {
+                return new int[][]{
+                        {b, midpoint, w},
+                        {midpoint, a, w}
+                };
+            }
+        }
+        return null;
+    }
+
+    private static boolean collapseEdge(MutableTopology mesh, EdgeRecord edge) {
+        if (edge == null || edge.count != 2) return false;
+        int keep = edge.a;
+        int remove = edge.b;
+        float[] a = mesh.vertices.get(keep);
+        float[] b = mesh.vertices.get(remove);
+        if (a == null || b == null) return false;
+        if (!collapseLinkCondition(mesh, edge)) return false;
+
+        float[] midpoint = new float[]{
+                (a[0] + b[0]) * 0.5f,
+                (a[1] + b[1]) * 0.5f,
+                (a[2] + b[2]) * 0.5f
+        };
+
+        // Validate all faces in the one-ring before mutating connectivity.
+        for (int[] face : mesh.faces) {
+            boolean touches = contains(face, keep) || contains(face, remove);
+            if (!touches) continue;
+            int na = face[0] == remove ? keep : face[0];
+            int nb = face[1] == remove ? keep : face[1];
+            int nc = face[2] == remove ? keep : face[2];
+            if (na == nb || nb == nc || nc == na) continue; // the two edge faces disappear
+
+            float[] oldNormal = faceNormal(mesh.vertices, face[0], face[1], face[2], -1, null);
+            float[] newNormal = faceNormal(mesh.vertices, na, nb, nc, keep, midpoint);
+            float oldLen = length(oldNormal[0], oldNormal[1], oldNormal[2]);
+            float newLen = length(newNormal[0], newNormal[1], newNormal[2]);
+            if (!(newLen > 1e-8f) || !(oldLen > 1e-8f)) return false;
+            float dot = (oldNormal[0] * newNormal[0]
+                    + oldNormal[1] * newNormal[1]
+                    + oldNormal[2] * newNormal[2]) / (oldLen * newLen);
+            if (!Float.isFinite(dot) || dot < 0.32f) return false;
+        }
+
+        List<int[]> rebuilt = new ArrayList<>(mesh.faces.size() - 2);
+        for (int[] face : mesh.faces) {
+            int x = face[0] == remove ? keep : face[0];
+            int y = face[1] == remove ? keep : face[1];
+            int z = face[2] == remove ? keep : face[2];
+            if (x == y || y == z || z == x) continue;
+            rebuilt.add(new int[]{x, y, z});
+        }
+        float[] oldKeep = mesh.vertices.get(keep);
+        float[] oldRemove = mesh.vertices.get(remove);
+        mesh.vertices.set(keep, midpoint);
+        mesh.vertices.set(remove, null);
+        List<int[]> oldFaces = mesh.faces;
+        mesh.faces = rebuilt;
+
+        if (!mutableClosedTwoManifold(mesh.faces)) {
+            mesh.vertices.set(keep, oldKeep);
+            mesh.vertices.set(remove, oldRemove);
+            mesh.faces = oldFaces;
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean collapseLinkCondition(MutableTopology mesh, EdgeRecord edge) {
+        Set<Integer> aNeighbors = new HashSet<>();
+        Set<Integer> bNeighbors = new HashSet<>();
+        for (int[] face : mesh.faces) {
+            if (contains(face, edge.a)) for (int v : face) if (v != edge.a) aNeighbors.add(v);
+            if (contains(face, edge.b)) for (int v : face) if (v != edge.b) bNeighbors.add(v);
+        }
+        aNeighbors.retainAll(bNeighbors);
+        aNeighbors.remove(edge.a);
+        aNeighbors.remove(edge.b);
+        if (aNeighbors.size() != 2) return false;
+
+        int opposite0 = oppositeVertex(mesh.faces.get(edge.face0), edge.a, edge.b);
+        int opposite1 = oppositeVertex(mesh.faces.get(edge.face1), edge.a, edge.b);
+        return opposite0 >= 0 && opposite1 >= 0 && opposite0 != opposite1
+                && aNeighbors.contains(opposite0) && aNeighbors.contains(opposite1);
+    }
+
+    private static int oppositeVertex(int[] face, int a, int b) {
+        for (int v : face) if (v != a && v != b) return v;
+        return -1;
+    }
+
+    private static boolean contains(int[] face, int vertex) {
+        return face[0] == vertex || face[1] == vertex || face[2] == vertex;
+    }
+
+    private static float[] faceNormal(
+            List<float[]> vertices,
+            int a, int b, int c,
+            int overrideVertex,
+            float[] overridePosition
+    ) {
+        float[] pa = a == overrideVertex ? overridePosition : vertices.get(a);
+        float[] pb = b == overrideVertex ? overridePosition : vertices.get(b);
+        float[] pc = c == overrideVertex ? overridePosition : vertices.get(c);
+        float abx = pb[0] - pa[0];
+        float aby = pb[1] - pa[1];
+        float abz = pb[2] - pa[2];
+        float acx = pc[0] - pa[0];
+        float acy = pc[1] - pa[1];
+        float acz = pc[2] - pa[2];
+        return new float[]{
+                aby * acz - abz * acy,
+                abz * acx - abx * acz,
+                abx * acy - aby * acx
+        };
+    }
+
+    private static Map<Long, EdgeRecord> buildEdgeRecords(List<int[]> faces) {
+        Map<Long, EdgeRecord> edges = new HashMap<>(faces.size() * 2);
+        for (int faceIndex = 0; faceIndex < faces.size(); faceIndex++) {
+            int[] face = faces.get(faceIndex);
+            addEdgeRecord(edges, face[0], face[1], faceIndex);
+            addEdgeRecord(edges, face[1], face[2], faceIndex);
+            addEdgeRecord(edges, face[2], face[0], faceIndex);
+        }
+        return edges;
+    }
+
+    private static void addEdgeRecord(Map<Long, EdgeRecord> edges, int a, int b, int face) {
+        int min = Math.min(a, b);
+        int max = Math.max(a, b);
+        long key = (((long) min) << 32) | (max & 0xffffffffL);
+        EdgeRecord record = edges.get(key);
+        if (record == null) {
+            record = new EdgeRecord(key, min, max);
+            edges.put(key, record);
+        }
+        if (record.count == 0) record.face0 = face;
+        else if (record.count == 1) record.face1 = face;
+        record.count++;
+    }
+
+    private static boolean mutableClosedTwoManifold(List<int[]> faces) {
+        Map<Long, Integer> counts = new HashMap<>(faces.size() * 2);
+        for (int[] face : faces) {
+            addEdgeCount(counts, face[0], face[1]);
+            addEdgeCount(counts, face[1], face[2]);
+            addEdgeCount(counts, face[2], face[0]);
+        }
+        if (counts.isEmpty()) return false;
+        for (int count : counts.values()) if (count != 2) return false;
+        return true;
+    }
+
+    private static boolean closedTwoManifold(int[] meshIndices) {
+        Map<Long, Integer> counts = new HashMap<>(meshIndices.length);
+        for (int i = 0; i < meshIndices.length; i += 3) {
+            addEdgeCount(counts, meshIndices[i], meshIndices[i + 1]);
+            addEdgeCount(counts, meshIndices[i + 1], meshIndices[i + 2]);
+            addEdgeCount(counts, meshIndices[i + 2], meshIndices[i]);
+        }
+        if (counts.isEmpty()) return false;
+        for (int count : counts.values()) if (count != 2) return false;
+        return true;
+    }
+
+    private static boolean allFiniteArray(float[] values) {
+        for (float value : values) if (!Float.isFinite(value)) return false;
+        return true;
+    }
+
+    private static float distanceSq(
+            float ax, float ay, float az,
+            float bx, float by, float bz
+    ) {
+        float dx = ax - bx;
+        float dy = ay - by;
+        float dz = az - bz;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static boolean hasCollapsibleShortEdge(
+            MutableTopology mesh,
+            float cx, float cy, float cz,
+            float radius,
+            float threshold,
+            boolean local,
+            long excludedKey
+    ) {
+        Map<Long, EdgeRecord> edges = buildEdgeRecords(mesh.faces);
+        for (EdgeRecord edge : edges.values()) {
+            if (edge.key == excludedKey || edge.count != 2) continue;
+            float[] a = mesh.vertices.get(edge.a);
+            float[] b = mesh.vertices.get(edge.b);
+            if (a == null || b == null) continue;
+            float mx = (a[0] + b[0]) * 0.5f;
+            float my = (a[1] + b[1]) * 0.5f;
+            float mz = (a[2] + b[2]) * 0.5f;
+            if (local && distanceSq(mx, my, mz, cx, cy, cz) > radius * radius) continue;
+            if (length(b[0] - a[0], b[1] - a[1], b[2] - a[2]) < threshold) return true;
+        }
+        return false;
+    }
+
+    private static boolean collapseFirstOtherShortEdge(
+            MutableTopology mesh,
+            float cx, float cy, float cz,
+            float radius,
+            float threshold,
+            boolean local,
+            long excludedKey
+    ) {
+        Map<Long, EdgeRecord> edges = buildEdgeRecords(mesh.faces);
+        List<EdgeRecord> candidates = new ArrayList<>();
+        for (EdgeRecord edge : edges.values()) {
+            if (edge.key == excludedKey || edge.count != 2) continue;
+            float[] a = mesh.vertices.get(edge.a);
+            float[] b = mesh.vertices.get(edge.b);
+            if (a == null || b == null) continue;
+            float mx = (a[0] + b[0]) * 0.5f;
+            float my = (a[1] + b[1]) * 0.5f;
+            float mz = (a[2] + b[2]) * 0.5f;
+            if (local && distanceSq(mx, my, mz, cx, cy, cz) > radius * radius) continue;
+            float len = length(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+            if (len < threshold) candidates.add(edge);
+        }
+        candidates.sort((left, right) -> {
+            float[] la = mesh.vertices.get(left.a), lb = mesh.vertices.get(left.b);
+            float[] ra = mesh.vertices.get(right.a), rb = mesh.vertices.get(right.b);
+            float ll = length(lb[0] - la[0], lb[1] - la[1], lb[2] - la[2]);
+            float rl = length(rb[0] - ra[0], rb[1] - ra[1], rb[2] - ra[2]);
+            return Float.compare(ll, rl);
+        });
+        for (EdgeRecord candidate : candidates) if (collapseEdge(mesh, candidate)) return true;
+        return false;
+    }
+
+    private static final class EdgeCandidate {
+        final EdgeRecord edge;
+        final float length;
+
+        EdgeCandidate(EdgeRecord edge, float length) {
+            this.edge = edge;
+            this.length = length;
+        }
+    }
+
+    private static final class EdgeRecord {
+        final long key;
+        final int a;
+        final int b;
+        int face0 = -1;
+        int face1 = -1;
+        int count = 0;
+        boolean blocked = false;
+
+        EdgeRecord(long key, int a, int b) {
+            this.key = key;
+            this.a = a;
+            this.b = b;
+        }
+    }
+
+    private static final class MeshArrays {
+        final float[] positions;
+        final int[] indices;
+
+        MeshArrays(float[] positions, int[] indices) {
+            this.positions = positions;
+            this.indices = indices;
+        }
+    }
+
+    private static final class MutableTopology {
+        final List<float[]> vertices;
+        List<int[]> faces;
+
+        MutableTopology(List<float[]> vertices, List<int[]> faces) {
+            this.vertices = vertices;
+            this.faces = faces;
+        }
+
+        static MutableTopology fromArrays(float[] positions, int[] indices) {
+            List<float[]> vertices = new ArrayList<>(positions.length / 3);
+            for (int i = 0; i < positions.length; i += 3) {
+                vertices.add(new float[]{positions[i], positions[i + 1], positions[i + 2]});
+            }
+            List<int[]> faces = new ArrayList<>(indices.length / 3);
+            for (int i = 0; i < indices.length; i += 3) {
+                faces.add(new int[]{indices[i], indices[i + 1], indices[i + 2]});
+            }
+            return new MutableTopology(vertices, faces);
+        }
+
+        MeshArrays compact() {
+            boolean[] used = new boolean[vertices.size()];
+            for (int[] face : faces) {
+                used[face[0]] = true;
+                used[face[1]] = true;
+                used[face[2]] = true;
+            }
+            int[] remap = new int[vertices.size()];
+            Arrays.fill(remap, -1);
+            int count = 0;
+            for (int i = 0; i < vertices.size(); i++) {
+                if (used[i] && vertices.get(i) != null) remap[i] = count++;
+            }
+            float[] outPositions = new float[count * 3];
+            for (int i = 0; i < vertices.size(); i++) {
+                int mapped = remap[i];
+                if (mapped < 0) continue;
+                float[] p = vertices.get(i);
+                outPositions[mapped * 3] = p[0];
+                outPositions[mapped * 3 + 1] = p[1];
+                outPositions[mapped * 3 + 2] = p[2];
+            }
+            int[] outIndices = new int[faces.size() * 3];
+            int out = 0;
+            for (int[] face : faces) {
+                outIndices[out++] = remap[face[0]];
+                outIndices[out++] = remap[face[1]];
+                outIndices[out++] = remap[face[2]];
+            }
+            return new MeshArrays(outPositions, outIndices);
+        }
     }
 
 
@@ -603,7 +1251,7 @@ final class SculptMesh {
     }
 
     void reset() {
-        System.arraycopy(originalPositions, 0, positions, 0, positions.length);
+        installTopology(resetPositions.clone(), resetIndices.clone(), true);
     }
 
     boolean isHealthy() {
@@ -611,7 +1259,7 @@ final class SculptMesh {
             if (!Float.isFinite(value)) return false;
         }
         for (int triangle = 0; triangle < indices.length / 3; triangle++) {
-            if (!validateTriangle(originalPositions, positions, triangle, false)) return false;
+            if (!validateTriangle(restPositions, positions, triangle, false)) return false;
         }
         return true;
     }
@@ -751,7 +1399,7 @@ final class SculptMesh {
 
                 float moveLen = length(dx, dy, dz);
                 float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
-                float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
+                float restEdge = minNeighborEdgeLengthFrom(restPositions, vertex);
                 float maxMove = Math.max(
                         0.00035f,
                         Math.min(currentEdge * 0.13f, restEdge * 0.16f)
@@ -866,9 +1514,9 @@ final class SculptMesh {
         float ab = edgeLength(candidate, a, b);
         float bc = edgeLength(candidate, b, c);
         float ca = edgeLength(candidate, c, a);
-        float restAb = edgeLength(originalPositions, a, b);
-        float restBc = edgeLength(originalPositions, b, c);
-        float restCa = edgeLength(originalPositions, c, a);
+        float restAb = edgeLength(restPositions, a, b);
+        float restBc = edgeLength(restPositions, b, c);
+        float restCa = edgeLength(restPositions, c, a);
 
         if (!edgeWithinRestBudget(ab, restAb)
                 || !edgeWithinRestBudget(bc, restBc)

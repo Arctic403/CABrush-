@@ -19,6 +19,7 @@ public class MainActivity extends Activity {
     private Button smoothButton;
     private Button symmetryButton;
     private Button grabButton;
+    private Button dynTopoButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -50,7 +51,7 @@ public class MainActivity extends Activity {
         bar.setBackgroundResource(com.fallpoint.pocketsculpt.R.drawable.panel_bg);
 
         TextView title = new TextView(this);
-        title.setText("PocketSculpt  V1.3");
+        title.setText("PocketSculpt  V1.4");
         title.setTextColor(Color.WHITE);
         title.setTextSize(17f);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
@@ -83,29 +84,53 @@ public class MainActivity extends Activity {
         symmetryButton = toolButton("Sym X", v -> toggleSymmetry());
 
         tools.addView(addButton, toolParams());
-        tools.addView(spacer(6));
+        tools.addView(spacer(5));
         tools.addView(subtractButton, toolParams());
-        tools.addView(spacer(6));
+        tools.addView(spacer(5));
         tools.addView(smoothButton, toolParams());
-        tools.addView(spacer(6));
+        tools.addView(spacer(5));
         tools.addView(grabButton, toolParams());
-        tools.addView(spacer(6));
+        tools.addView(spacer(5));
         tools.addView(symmetryButton, toolParams());
         panel.addView(tools);
 
-        LinearLayout sizeRow = sliderRow("Size", 10, 100, 38, value -> sculptView.setBrushRadius(0.08f + value * 0.0065f));
+        LinearLayout topology = new LinearLayout(this);
+        topology.setOrientation(LinearLayout.HORIZONTAL);
+        topology.setGravity(Gravity.CENTER_VERTICAL);
+        dynTopoButton = toolButton("DynTopo", v -> toggleDynamicTopology());
+        styleTool(dynTopoButton, true);
+        Button remeshButton = toolButton("Remesh", v -> sculptView.remeshNow());
+        Button sphereButton = toolButton("Sphere", v -> sculptView.newSphere());
+        Button humanButton = toolButton("Human", v -> sculptView.newHuman());
+        topology.addView(dynTopoButton, toolParams());
+        topology.addView(spacer(5));
+        topology.addView(remeshButton, toolParams());
+        topology.addView(spacer(5));
+        topology.addView(sphereButton, toolParams());
+        topology.addView(spacer(5));
+        topology.addView(humanButton, toolParams());
+        panel.addView(topology);
+
+        LinearLayout sizeRow = sliderRow("Size", 1, 100, 36, value -> sculptView.setBrushRadius(0.035f + value * 0.0065f));
         panel.addView(sizeRow);
 
-        LinearLayout strengthRow = sliderRow("Strength", 1, 100, 28, value -> sculptView.setBrushStrength(0.0025f + value * 0.00085f));
+        LinearLayout strengthRow = sliderRow("Strength", 1, 100, 28, value -> sculptView.setBrushStrength(0.0015f + value * 0.00070f));
         panel.addView(strengthRow);
 
+        LinearLayout detailRow = sliderRow("Detail", 1, 100, 56, value -> {
+            // Higher UI value = finer topology (smaller target edge ratio).
+            float ratio = 0.40f - (value / 100f) * 0.28f;
+            sculptView.setTopologyDetail(ratio);
+        });
+        panel.addView(detailRow);
+
         TextView help = new TextView(this);
-        help.setText("Clay builds/cuts  •  Grab shapes  •  2 fingers orbit / zoom");
+        help.setText("DynTopo adds/removes detail  •  Remesh uses current Size/Detail");
         help.setTextColor(Color.rgb(185, 192, 199));
-        help.setTextSize(12f);
+        help.setTextSize(11f);
         help.setGravity(Gravity.CENTER);
-        help.setPadding(0, dp(3), 0, 0);
-        panel.addView(help, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(26)));
+        help.setPadding(0, dp(2), 0, 0);
+        panel.addView(help, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(24)));
 
         return panel;
     }
@@ -149,6 +174,11 @@ public class MainActivity extends Activity {
     private void toggleSymmetry() {
         boolean enabled = sculptView.toggleSymmetry();
         styleTool(symmetryButton, enabled);
+    }
+
+    private void toggleDynamicTopology() {
+        boolean enabled = sculptView.toggleDynamicTopology();
+        styleTool(dynTopoButton, enabled);
     }
 
     private void styleTool(Button button, boolean active) {
@@ -204,7 +234,7 @@ public class MainActivity extends Activity {
     private FrameLayout.LayoutParams bottomPanelParams() {
         FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(190),
+                dp(286),
                 Gravity.BOTTOM
         );
         p.setMargins(dp(10), 0, dp(10), dp(10));
