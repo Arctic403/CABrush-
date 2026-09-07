@@ -5,9 +5,14 @@ on:
   push:
     branches: [ "main" ]
 
+concurrency:
+  group: cabrush-main-verify
+  cancel-in-progress: true
+
 jobs:
   verify-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
