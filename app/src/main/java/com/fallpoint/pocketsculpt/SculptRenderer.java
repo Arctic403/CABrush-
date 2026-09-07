@@ -46,7 +46,7 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
 
     private float yaw = 22f;
     private float pitch = 8f;
-    private float cameraDistance = 4.1f;
+    private float cameraDistance = 5.25f;
 
     private boolean buffersDirty = true;
     private boolean strokeActive = false;
@@ -54,6 +54,12 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
     private float lastDabX;
     private float lastDabY;
     private float[] strokeStartSnapshot;
+    private SculptMesh.GrabHandle grabHandle;
+    private SculptMesh.GrabHandle mirroredGrabHandle;
+    private final float[] grabPlanePoint = new float[3];
+    private final float[] grabPlaneNormal = new float[3];
+    private final float[] grabStartWorld = new float[3];
+    private boolean grabReady = false;
     private final Deque<float[]> undoStack = new ArrayDeque<>();
     private final Deque<float[]> redoStack = new ArrayDeque<>();
 
@@ -72,7 +78,7 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         uLightDirection = GLES30.glGetUniformLocation(program, "uLightDirection");
 
         if (mesh == null) {
-            mesh = SculptMesh.createIcoSphere(4, 1f);
+            mesh = SculptMesh.createHumanBase();
         }
         // Android may recreate the GL context even when the Activity survives.
         // Keep the CPU mesh/history and only recreate GPU-side buffers/program state.
@@ -137,13 +143,18 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         if (mesh == null || strokeActive) return;
         strokeActive = true;
         hasLastDab = false;
+        clearGrabState();
         strokeStartSnapshot = mesh.copyPositions();
     }
 
     public void endStroke() {
-        if (!strokeActive || mesh == null) return;
+        if (!strokeActive || mesh == null) {
+            clearGrabState();
+            return;
+        }
         strokeActive = false;
         hasLastDab = false;
+        clearGrabState();
         if (strokeStartSnapshot != null && !samePositions(strokeStartSnapshot, mesh.positions)) {
             undoStack.push(strokeStartSnapshot);
             trimHistory(undoStack);
@@ -154,6 +165,11 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
 
     public void sculptAt(float screenX, float screenY) {
         if (mesh == null || !strokeActive) return;
+
+        if (brushMode == BrushMode.GRAB) {
+            grabAt(screenX, screenY);
+            return;
+        }
 
         if (!hasLastDab) {
             if (sculptDab(screenX, screenY)) {
@@ -185,6 +201,101 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         float t = consumed * invDistance;
         lastDabX = startX + dx * t;
         lastDabY = startY + dy * t;
+    }
+
+    private void clearGrabState() {
+        grabHandle = null;
+        mirroredGrabHandle = null;
+        grabReady = false;
+    }
+
+    private boolean grabAt(float screenX, float screenY) {
+        updateMatrices();
+        Ray ray = screenRay(screenX, screenY);
+        if (ray == null) return false;
+
+        if (!grabReady) {
+            SculptMesh.Hit hit = mesh.raycast(ray.origin, ray.direction);
+            if (hit == null) return false;
+
+            grabHandle = mesh.beginGrab(
+                    hit.x, hit.y, hit.z,
+                    hit.nx, hit.ny, hit.nz,
+                    ray.direction,
+                    brushRadius,
+                    true
+            );
+            if (grabHandle == null) return false;
+
+            grabPlanePoint[0] = hit.x;
+            grabPlanePoint[1] = hit.y;
+            grabPlanePoint[2] = hit.z;
+            grabPlaneNormal[0] = ray.direction[0];
+            grabPlaneNormal[1] = ray.direction[1];
+            grabPlaneNormal[2] = ray.direction[2];
+            grabStartWorld[0] = hit.x;
+            grabStartWorld[1] = hit.y;
+            grabStartWorld[2] = hit.z;
+
+            if (symmetryX && Math.abs(hit.x) * 2f >= brushRadius * 1.10f) {
+                float[] mirroredView = new float[]{
+                        -ray.direction[0],
+                        ray.direction[1],
+                        ray.direction[2]
+                };
+                mirroredGrabHandle = mesh.beginGrab(
+                        -hit.x, hit.y, hit.z,
+                        -hit.nx, hit.ny, hit.nz,
+                        mirroredView,
+                        brushRadius,
+                        false
+                );
+            }
+            grabReady = true;
+            return true;
+        }
+
+        float[] world = intersectRayPlane(ray, grabPlanePoint, grabPlaneNormal);
+        if (world == null) return false;
+
+        float dx = world[0] - grabStartWorld[0];
+        float dy = world[1] - grabStartWorld[1];
+        float dz = world[2] - grabStartWorld[2];
+
+        boolean changed = mesh.applyGrab(grabHandle, dx, dy, dz, brushStrength);
+        if (mirroredGrabHandle != null) {
+            boolean mirroredChanged = mesh.applyGrab(
+                    mirroredGrabHandle,
+                    -dx, dy, dz,
+                    brushStrength
+            );
+            changed |= mirroredChanged;
+        }
+
+        if (changed) {
+            mesh.recalculateNormals();
+            buffersDirty = true;
+        }
+        return true;
+    }
+
+    private float[] intersectRayPlane(Ray ray, float[] point, float[] normal) {
+        float denom = ray.direction[0] * normal[0]
+                + ray.direction[1] * normal[1]
+                + ray.direction[2] * normal[2];
+        if (Math.abs(denom) < 1e-6f) return null;
+
+        float px = point[0] - ray.origin[0];
+        float py = point[1] - ray.origin[1];
+        float pz = point[2] - ray.origin[2];
+        float t = (px * normal[0] + py * normal[1] + pz * normal[2]) / denom;
+        if (!Float.isFinite(t)) return null;
+
+        return new float[]{
+                ray.origin[0] + ray.direction[0] * t,
+                ray.origin[1] + ray.direction[1] * t,
+                ray.origin[2] + ray.direction[2] * t
+        };
     }
 
     private boolean sculptDab(float screenX, float screenY) {

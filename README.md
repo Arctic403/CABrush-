@@ -1,52 +1,110 @@
-# PocketSculpt V1.2
+# PocketSculpt V1.3 — Character Blockout
 
-PocketSculpt is a deliberately small Android-native sculpting prototype. V1.2 focuses on making the fixed-topology sculpt core fail safely on real phones before the hot path moves to C++/NDK and before dynamic remeshing is introduced.
+PocketSculpt is a small Android-native sculpting prototype aimed at character creation on real phones, including 32-bit Android devices. V1.3 changes the target from “deform a sphere safely” to “block out a usable game character.”
 
-## V1.2 stability patch
+## V1.3 character sculpt patch
 
-The V1.1 screenshots exposed a second geometry failure after the UV-sphere seam was fixed: individual vertex moves were checked one at a time and only against the immediately previous triangle shape. Repeated legal moves could therefore accumulate into extremely stretched triangles, fins, and folded sheets without ever creating a zero-area triangle.
+### Character base instead of a bowling ball
 
-V1.2 changes the sculpt operation from "move vertices and hope" to a transaction:
+PocketSculpt now starts from a neutral, watertight humanoid blockout generated locally at startup.
 
-- Every brush dab is computed into scratch buffers first.
-- All affected triangles are validated before the dab is committed.
-- Failed candidates are retried with progressively smaller displacement.
-- A dab is rejected completely if no safe displacement can be found.
-- Triangle area, orientation change, shape quality, finite coordinates, per-step edge change, and edge stretch/compression versus the original mesh are checked.
-- The fixed topology now has a hard deformation budget. When a region reaches that budget, the brush stops pushing it farther instead of turning it into a spike.
-- The transaction buffers are reused to avoid full-mesh garbage allocation on every dab.
+- one connected closed surface
+- head, neck, torso, pelvis, arms, hands, legs and feet
+- generated from a smooth implicit field and polygonized with marching tetrahedra
+- approximately 4.2k vertices / 8.4k triangles on the current grid
+- no external model asset required
+- Reset returns to the clean humanoid base
 
-Additional hardening:
+The older watertight icosphere generator remains in the core for regression tests and future primitive workflows.
 
-- Clay Add/Subtract continue to use an averaged local surface normal, matching the broad behavior used by established sculpt tools.
-- Brush selection is front-facing and topologically connected and now also rejects nearby folded sheets whose normals strongly disagree with the hit surface.
-- X symmetry reduces overlapping center-line contributions so the same area is not accidentally hit at double strength.
-- Normals are refreshed before the mirrored symmetry transaction when the primary side changed.
-- Android batched touch history is consumed in order so curved finger paths are not replaced by long straight chords on slower devices.
-- An interrupted stroke is closed when the `GLSurfaceView` pauses, preventing a stuck `strokeActive` state after app switching.
-- CPU mesh/history survive an OpenGL context recreation; only GPU program/buffer state is recreated.
-- Undo/redo history is bounded on both stacks and Reset no longer adds a no-op history entry.
-- Non-finite input/snapshot values are rejected defensively.
+### Clay + / Clay -
 
-## Current features
+Clay is now plane-based rather than generic normal displacement.
 
-- Real-time OpenGL ES 3.0 shaded mesh
-- Watertight level-4 icosphere: 2,562 shared vertices / 5,120 triangles
-- Clay Add brush
-- Clay Subtract brush
-- Smooth brush with two-pass Taubin-style relaxation
-- Adjustable brush size and strength
-- X symmetry
-- 20-step undo/redo history
-- Reset mesh
-- One-finger sculpting
-- Two-finger orbit
-- Pinch zoom
-- CPU triangle ray-picking against the deformed mesh
-- Radius-based stroke spacing
-- Front-facing/topology-aware brush selection
-- Transactional fixed-topology geometry guard
-- No native libraries, so V1.2 remains ABI-neutral and runs as one APK on both 32-bit and 64-bit Android devices that support OpenGL ES 3.0
+Each dab:
+1. finds a connected front-facing brush region,
+2. computes a weighted average surface normal,
+3. builds a local sculpt plane from the ray hit,
+4. adds or removes volume toward that plane,
+5. blends the rim with a smooth falloff,
+6. commits only when the complete candidate deformation passes the transactional geometry guard.
+
+This gives broad anatomy-building behavior instead of only making round bumps.
+
+### Smooth
+
+The previous near-cancelling two-pass Taubin fairing made the Smooth tool feel almost inactive under a finger.
+
+V1.3 Smooth now performs two controlled positive Laplacian relaxations per accepted dab. It intentionally removes local bumps/noise and may shrink the surface slightly, which is expected for a normal sculpt Smooth brush. It still uses the transactional geometry validator.
+
+### Grab
+
+Grab is now a real brush mode for character proportions.
+
+- captures the affected vertices at stroke start
+- drags them in the screen-facing plane
+- keeps the original brush falloff throughout the stroke
+- supports X symmetry
+- runs through the same geometry safety transaction
+- useful for skull shape, jaw width, shoulders, hips, limbs and silhouette changes
+
+## Current tools
+
+- **Clay +** — build broad volume
+- **Clay -** — carve volume away
+- **Smooth** — visibly relax rough surface
+- **Grab** — move a captured region for proportions/silhouette
+- **Sym X** — mirror sculpting across X
+- adjustable Size / Strength
+- stroke-level Undo / Redo
+- Reset to humanoid base
+- one-finger sculpt
+- two-finger orbit
+- pinch zoom
+
+## Geometry safety
+
+V1.2’s transactional guard remains active.
+
+Brushes do not mutate the live mesh one vertex at a time. Each operation is assembled into a candidate, affected triangles are validated, and the entire operation is either committed at a safe scale or rejected.
+
+Checks include:
+
+- finite coordinates
+- triangle area
+- face orientation changes
+- edge compression/stretch
+- per-step edge change
+- triangle quality
+
+The humanoid generator also clamps iso-surface edge interpolation away from exact grid corners to avoid starting with pathological sliver triangles.
+
+## Character workflow in V1.3
+
+A practical blockout flow is now:
+
+1. Start from the humanoid base.
+2. Use **Grab + Sym X** for overall proportions and silhouette.
+3. Use **Clay +** for skull masses, chest, shoulders, muscle groups and other broad forms.
+4. Use **Clay -** for eye sockets, neck transitions and broad recesses.
+5. Use **Smooth** repeatedly to blend blockout planes and remove unwanted lumps.
+6. Rotate frequently and work from several views.
+
+This is now a character blockout tool, but it is not yet a full ZBrush/Nomad replacement.
+
+## Why dynamic topology is still next
+
+V1.3 deliberately does not fake unlimited free-form sculpting on fixed topology.
+
+For extreme limb pulls, fingers, ears, noses and high-detail anatomy, the mesh eventually needs new topology. The next major geometry milestone remains remeshing/dynamic topology:
+
+1. split long edges,
+2. collapse short edges,
+3. flip edges when triangulation improves,
+4. relax vertices tangentially,
+5. preserve/reproject the sculpted surface.
+
+The existing geometry guard should remain as the final safety layer around those topology edits.
 
 ## Build
 
@@ -54,85 +112,74 @@ Additional hardening:
 
 1. Open the repository.
 2. Let Gradle sync.
-3. Install Android SDK Platform 35 if Android Studio asks.
-4. Run the `app` configuration on an Android 7.0+ device.
+3. Install Android SDK Platform 35 if requested.
+4. Run the `app` configuration on Android 7.0+.
 
 ### GitHub Actions / command line
 
-The workflow uses JDK 17, Gradle 8.7, Android SDK 35, and AGP 8.6.1. Before assembling the APK it compiles and runs a pure-Java sculpt-core stress test.
+The workflow uses:
+
+- JDK 17
+- Gradle 8.7
+- Android Gradle Plugin 8.6.1
+- compileSdk / targetSdk 35
+
+Before assembling the APK, CI compiles and runs `tools/SculptCoreSelfTest.java`.
 
 With Gradle 8.7 installed:
 
     gradle assembleDebug
 
-APK output:
+APK:
 
     app/build/outputs/apk/debug/app-debug.apk
 
-## Controls
+## Android / ABI support
 
-- **Clay +**: push the surface outward.
-- **Clay -**: carve inward.
-- **Smooth**: relax nearby vertices with reduced shrinkage.
-- **Sym X**: mirror brush strokes across the X axis.
-- **1 finger**: sculpt.
-- **2 fingers drag**: orbit camera.
-- **Pinch**: zoom.
-- **Undo / Redo**: stroke-level history.
+V1.3 is still Java + Android SDK + OpenGL ES 3.0. It contains no native `.so` libraries, so there is currently no native ABI split and the app remains usable on supported 32-bit and 64-bit Android devices.
 
-## Architecture
+When the hot path later moves to the NDK, ship both:
 
-V1.2 intentionally remains Android SDK + Java:
+- `armeabi-v7a`
+- `arm64-v8a`
 
-- `MainActivity` — touch-first overlay UI
-- `SculptSurfaceView` — gesture routing, batched touch history, GL-thread dispatch, lifecycle cleanup
-- `SculptRenderer` — camera, OpenGL ES rendering, screen-ray generation, stroke spacing, symmetry, history
-- `SculptMesh` — watertight topology, ray/triangle intersection, connected brush selection, transactional deformation, geometry validation, smoothing, normals
-- `tools/SculptCoreSelfTest.java` — dependency-free regression/stress test run by CI
+## V1.3 automated validation
 
-Keeping the hot path Java-only for this stage preserves the current ABI-neutral APK. When native code is introduced, ship both `armeabi-v7a` and `arm64-v8a`.
+The dependency-free sculpt-core test now checks:
 
-## Validation performed for V1.2
+- watertight icosphere regression path
+- humanoid base generation
+- humanoid vertex/triangle mobile budget
+- closed two-manifold topology
+- one connected humanoid surface
+- healthy starting geometry
+- Clay + produces outward volume
+- Clay - produces inward carving
+- Smooth produces measurable movement and reduces Laplacian roughness
+- Grab produces useful proportion movement
+- mixed character brush stress remains healthy
+- post-stress ray picking still works
 
-The pure Java core was compiled and stress-tested independently of Android:
+Android-facing Java is also syntax/signature checked during development against API stubs when the Android SDK is unavailable in the patching environment.
 
-- Verified 2,562 vertices and 5,120 triangles.
-- Verified every undirected starting edge belongs to exactly two triangles.
-- Verified the fresh mesh passes the same runtime health rules used by the deformation guard.
-- Repeatedly hammered one region with hundreds of Add strokes, then hundreds of Subtract strokes.
-- Ran a mixed randomized Add/Subtract/Smooth workload including mirrored operations.
-- Verified positions stay finite and the mesh remains inside the fixed-topology edge/area/quality budget.
-- Verified ray-picking still succeeds after the stress workload.
-- Compiled `SculptRenderer` and `SculptSurfaceView` against Android API stubs to catch Java signature/syntax regressions in the edited renderer/input code.
-- Parsed all Android resource XML successfully.
+## Remaining limits
 
-The previous concentrated V1.1 stress case could grow a local edge to many times its starting length while remaining technically non-degenerate. With V1.2 the same class of test saturates at the configured fixed-topology budget instead of continuing to stretch.
+- no dynamic topology / voxel remesh yet
+- fixed topology still imposes a hard deformation budget
+- CPU brute-force raycast over the current triangles
+- CPU full normal rebuild after accepted brush operations
+- no masks / layers / crease / inflate / flatten yet
+- no OBJ/GLB import/export yet
+- no stylus pressure yet
+- no persistent autosave after process death yet
 
-## Important fixed-topology limit
+## Research direction
 
-V1.2 intentionally does **not** pretend fixed topology can support unlimited sculpting.
+V1.3 follows the same broad sculpting concepts documented by established tools:
 
-Once local triangles reach the deformation budget, further extreme displacement is rejected. This is the correct safe behavior for this version. The next major geometry step is local dynamic remeshing so the app can add/remove topology as forms are stretched or compressed.
+- Blender’s common sculpt workflow uses Clay Strips for broad volume, Grab for proportions, Smooth for cleanup, and Draw for generic add/subtract.
+- Blender describes Grab as an essential shape/proportion brush.
+- Nomad recommends voxel remeshing or dynamic topology when stretched polygons need fresh density.
+- Isotropic remeshing literature and CGAL’s implementation use split → collapse → flip → relax → reproject.
 
-A production remeshing path should use the established sequence:
-
-1. split edges that are too long,
-2. collapse edges that are too short,
-3. flip edges where it improves triangulation,
-4. relax vertices tangentially,
-5. preserve/reproject the intended surface.
-
-Do not remove the V1.2 geometry guard when dynamic remeshing arrives; it should remain the last line of defense around topology edits.
-
-## Remaining limits / next audit targets
-
-- Fixed topology; no edge split/collapse/flip yet.
-- CPU brute-force raycast across all 5,120 triangles.
-- CPU full normal rebuild after accepted dabs.
-- Brush selection still allocates temporary traversal arrays.
-- No spatial acceleration structure yet.
-- No OBJ/GLB import/export yet.
-- No masks, layers, materials, alpha brushes, stylus pressure, autosave, or crash recovery yet.
-- Sculpt state is kept in CPU memory but is not persisted to disk across a process kill.
-
-The next performance milestone should be profiling on the actual 32-bit target before moving hot loops to C++/NDK.
+See `docs/CHARACTER_SCULPT_AUDIT_V1_3.md` for the detailed audit.

@@ -61,6 +61,20 @@ final class SculptMesh {
         }
     }
 
+    static final class GrabHandle {
+        final int[] vertices;
+        final float[] weights;
+        final float[] basePositions;
+        final int count;
+
+        GrabHandle(int[] vertices, float[] weights, float[] basePositions, int count) {
+            this.vertices = vertices;
+            this.weights = weights;
+            this.basePositions = basePositions;
+            this.count = count;
+        }
+    }
+
     private SculptMesh(float[] positions, int[] indices) {
         this.positions = positions;
         this.originalPositions = positions.clone();
@@ -159,6 +173,107 @@ final class SculptMesh {
         return new SculptMesh(outPositions, outIndices);
     }
 
+    static SculptMesh createHumanBase() {
+        // Low-resolution watertight character blockout generated from a smooth
+        // implicit union. Marching tetrahedra gives us one connected triangle
+        // surface with no intersecting "primitive shells" inside the body.
+        final int nx = 22;
+        final int ny = 32;
+        final int nz = 16;
+        final float xmin = -1.05f, xmax = 1.05f;
+        final float ymin = -1.68f, ymax = 1.72f;
+        final float zmin = -0.65f, zmax = 0.65f;
+        final int pointCount = nx * ny * nz;
+
+        float[] gridPositions = new float[pointCount * 3];
+        float[] field = new float[pointCount];
+
+        for (int k = 0; k < nz; k++) {
+            float z = lerp(zmin, zmax, k / (float) (nz - 1));
+            for (int j = 0; j < ny; j++) {
+                float y = lerp(ymin, ymax, j / (float) (ny - 1));
+                for (int i = 0; i < nx; i++) {
+                    float x = lerp(xmin, xmax, i / (float) (nx - 1));
+                    int id = gridId(i, j, k, nx, ny);
+                    int base = id * 3;
+                    gridPositions[base] = x;
+                    gridPositions[base + 1] = y;
+                    gridPositions[base + 2] = z;
+                    field[id] = humanField(x, y, z);
+                }
+            }
+        }
+
+        final int[][] cubeCorners = {
+                {0,0,0}, {1,0,0}, {1,1,0}, {0,1,0},
+                {0,0,1}, {1,0,1}, {1,1,1}, {0,1,1}
+        };
+        final int[][] tetrahedra = {
+                {0,1,2,6}, {0,2,3,6}, {0,3,7,6},
+                {0,7,4,6}, {0,4,5,6}, {0,5,1,6}
+        };
+
+        List<float[]> vertices = new ArrayList<>();
+        List<int[]> faces = new ArrayList<>();
+        Map<Long, Integer> edgeCache = new HashMap<>();
+
+        int[] cube = new int[8];
+        int[] tet = new int[4];
+
+        for (int k = 0; k < nz - 1; k++) {
+            for (int j = 0; j < ny - 1; j++) {
+                for (int i = 0; i < nx - 1; i++) {
+                    for (int c = 0; c < 8; c++) {
+                        int[] o = cubeCorners[c];
+                        cube[c] = gridId(i + o[0], j + o[1], k + o[2], nx, ny);
+                    }
+
+                    for (int[] tetra : tetrahedra) {
+                        for (int q = 0; q < 4; q++) tet[q] = cube[tetra[q]];
+                        polygonizeTetra(
+                                tet,
+                                gridPositions,
+                                field,
+                                edgeCache,
+                                vertices,
+                                faces
+                        );
+                    }
+                }
+            }
+        }
+
+        if (vertices.isEmpty() || faces.isEmpty()) {
+            throw new IllegalStateException("Human base polygonization produced no surface");
+        }
+
+        float[] outPositions = new float[vertices.size() * 3];
+        for (int i = 0; i < vertices.size(); i++) {
+            float[] p = vertices.get(i);
+            outPositions[i * 3] = p[0];
+            outPositions[i * 3 + 1] = p[1];
+            outPositions[i * 3 + 2] = p[2];
+        }
+
+        int[] outIndices = new int[faces.size() * 3];
+        int out = 0;
+        for (int[] face : faces) {
+            outIndices[out++] = face[0];
+            outIndices[out++] = face[1];
+            outIndices[out++] = face[2];
+        }
+
+        SculptMesh mesh = new SculptMesh(outPositions, outIndices);
+        if (!mesh.isClosedTwoManifold()) {
+            throw new IllegalStateException("Human base must be a closed two-manifold");
+        }
+        if (!mesh.isHealthy()) {
+            throw new IllegalStateException("Human base failed geometry health validation");
+        }
+        return mesh;
+    }
+
+
     boolean applyBrush(
             float cx, float cy, float cz,
             float hitNx, float hitNy, float hitNz,
@@ -168,7 +283,8 @@ final class SculptMesh {
             BrushMode mode,
             boolean frontFaceOnly
     ) {
-        if (!(radius > 0f) || !(strength > 0f)) return false;
+        if (!(radius > 0f) || !(strength > 0f) || mode == null) return false;
+        if (mode == BrushMode.GRAB) return false;
         if (!allFinite(cx, cy, cz, hitNx, hitNy, hitNz, radius, strength)) return false;
 
         Selection selection = collectSelection(
@@ -181,15 +297,152 @@ final class SculptMesh {
         if (selection.count == 0) return false;
 
         if (mode == BrushMode.SMOOTH) {
-            return applyTaubinSmooth(selection, strength);
+            return applySmooth(selection, strength);
         }
 
         System.arraycopy(positions, 0, beforeScratch, 0, positions.length);
         Arrays.fill(deltaScratch, 0f);
 
-        // Blender's Draw brush direction is based on the average normal in the
-        // active area. Use the same broad behavior, but keep it oriented with
-        // the ray-hit face so a damaged/stale vertex normal cannot reverse it.
+        float[] brushNormal = averagedSelectionNormal(selection, hitNx, hitNy, hitNz);
+        float nx = brushNormal[0];
+        float ny = brushNormal[1];
+        float nz = brushNormal[2];
+        if (length(nx, ny, nz) < 1e-6f) return false;
+
+        // Clay is plane-based rather than a generic "move every point along a
+        // normal" brush. This both builds/removes volume and gently levels the
+        // active patch, which is far more useful for anatomy blockout.
+        float clayStep = Math.min(radius * 0.14f, strength * 1.35f);
+        clayStep = Math.max(clayStep, radius * 0.012f);
+        float targetPlane = mode == BrushMode.ADD ? clayStep : -clayStep;
+        boolean anyDelta = false;
+
+        for (int s = 0; s < selection.count; s++) {
+            int vertex = selection.vertices[s];
+            int base = vertex * 3;
+
+            float relX = beforeScratch[base] - cx;
+            float relY = beforeScratch[base + 1] - cy;
+            float relZ = beforeScratch[base + 2] - cz;
+            float signedDistance = relX * nx + relY * ny + relZ * nz;
+
+            float raw;
+            if (mode == BrushMode.ADD) {
+                raw = Math.max(0f, targetPlane - signedDistance);
+            } else {
+                raw = Math.min(0f, targetPlane - signedDistance);
+            }
+
+            // Weight twice: once for the normal clay falloff and once again at
+            // the rim so large brushes blend into surrounding anatomy instead
+            // of leaving a hard circular ledge.
+            float w = selection.weights[s];
+            float amount = raw * w * (0.35f + 0.65f * w);
+
+            float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
+            float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
+            float maxMove = Math.max(
+                    0.00035f,
+                    Math.min(currentEdge * 0.12f, restEdge * 0.16f)
+            );
+            amount = clamp(amount, -maxMove, maxMove);
+
+            deltaScratch[base] = nx * amount;
+            deltaScratch[base + 1] = ny * amount;
+            deltaScratch[base + 2] = nz * amount;
+            anyDelta |= Math.abs(amount) > 1e-9f;
+        }
+
+        return anyDelta && commitTransactional(selection, beforeScratch, deltaScratch);
+    }
+
+    GrabHandle beginGrab(
+            float cx, float cy, float cz,
+            float hitNx, float hitNy, float hitNz,
+            float[] viewDirection,
+            float radius,
+            boolean frontFaceOnly
+    ) {
+        if (!(radius > 0f) || !allFinite(cx, cy, cz, hitNx, hitNy, hitNz, radius)) return null;
+        Selection selection = collectSelection(
+                cx, cy, cz,
+                hitNx, hitNy, hitNz,
+                radius,
+                viewDirection,
+                frontFaceOnly
+        );
+        if (selection.count == 0) return null;
+
+        int[] selected = Arrays.copyOf(selection.vertices, selection.count);
+        float[] weights = Arrays.copyOf(selection.weights, selection.count);
+        float[] base = new float[selection.count * 3];
+        for (int s = 0; s < selection.count; s++) {
+            int vertexBase = selected[s] * 3;
+            base[s * 3] = positions[vertexBase];
+            base[s * 3 + 1] = positions[vertexBase + 1];
+            base[s * 3 + 2] = positions[vertexBase + 2];
+        }
+        return new GrabHandle(selected, weights, base, selection.count);
+    }
+
+    boolean applyGrab(GrabHandle handle, float dx, float dy, float dz, float strength) {
+        if (handle == null || handle.count == 0) return false;
+        if (!allFinite(dx, dy, dz, strength)) return false;
+
+        float dragLength = length(dx, dy, dz);
+        if (dragLength < 1e-7f) return false;
+
+        // Grab is a proportion tool, not a tiny normal-displacement brush.
+        // Preserve a meaningful response even when the clay strength slider is low.
+        float response = clamp(0.28f + strength * 22f, 0.35f, 1.15f);
+
+        System.arraycopy(positions, 0, beforeScratch, 0, positions.length);
+        Arrays.fill(deltaScratch, 0f);
+
+        int[] vertices = handle.vertices;
+        float[] weights = handle.weights;
+        for (int s = 0; s < handle.count; s++) {
+            int vertex = vertices[s];
+            int base = vertex * 3;
+            int hb = s * 3;
+            float w = weights[s];
+            float targetX = handle.basePositions[hb] + dx * w * response;
+            float targetY = handle.basePositions[hb + 1] + dy * w * response;
+            float targetZ = handle.basePositions[hb + 2] + dz * w * response;
+
+            float moveX = targetX - beforeScratch[base];
+            float moveY = targetY - beforeScratch[base + 1];
+            float moveZ = targetZ - beforeScratch[base + 2];
+
+            float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
+            float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
+            float maxMove = Math.max(
+                    0.0005f,
+                    Math.min(currentEdge * 0.22f, restEdge * 0.30f)
+            );
+            float moveLength = length(moveX, moveY, moveZ);
+            if (moveLength > maxMove && moveLength > 1e-8f) {
+                float k = maxMove / moveLength;
+                moveX *= k;
+                moveY *= k;
+                moveZ *= k;
+            }
+
+            deltaScratch[base] = moveX;
+            deltaScratch[base + 1] = moveY;
+            deltaScratch[base + 2] = moveZ;
+        }
+
+        Selection stable = new Selection(vertices, weights, handle.count);
+        return commitTransactional(stable, beforeScratch, deltaScratch);
+    }
+
+    private float[] averagedSelectionNormal(
+            Selection selection,
+            float hitNx,
+            float hitNy,
+            float hitNz
+    ) {
         float nx = 0f, ny = 0f, nz = 0f, total = 0f;
         for (int s = 0; s < selection.count; s++) {
             int vertex = selection.vertices[s];
@@ -218,7 +471,8 @@ final class SculptMesh {
             nz = hitNz;
             nLen = length(nx, ny, nz);
         }
-        if (nLen < 1e-6f) return false;
+        if (nLen < 1e-6f) return new float[]{0f, 0f, 0f};
+
         nx /= nLen;
         ny /= nLen;
         nz /= nLen;
@@ -234,31 +488,9 @@ final class SculptMesh {
                 nz = -nz;
             }
         }
-
-        float sign = mode == BrushMode.ADD ? 1f : -1f;
-        boolean anyDelta = false;
-
-        for (int s = 0; s < selection.count; s++) {
-            int vertex = selection.vertices[s];
-            int base = vertex * 3;
-
-            float amount = strength * selection.weights[s] * sign;
-            float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
-            float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
-            float maxMove = Math.max(
-                    0.00035f,
-                    Math.min(currentEdge * 0.11f, restEdge * 0.14f)
-            );
-            amount = clamp(amount, -maxMove, maxMove);
-
-            deltaScratch[base] = nx * amount;
-            deltaScratch[base + 1] = ny * amount;
-            deltaScratch[base + 2] = nz * amount;
-            anyDelta |= Math.abs(amount) > 1e-9f;
-        }
-
-        return anyDelta && commitTransactional(selection, beforeScratch, deltaScratch);
+        return new float[]{nx, ny, nz};
     }
+
 
     Hit raycast(float[] origin, float[] direction) {
         if (origin == null || direction == null || origin.length < 3 || direction.length < 3) return null;
@@ -482,66 +714,72 @@ final class SculptMesh {
         return dot > -0.20f;
     }
 
-    private boolean applyTaubinSmooth(Selection selection, float strength) {
-        float lambda = clamp(strength * 8f, 0.035f, 0.30f);
-        float mu = -lambda * 1.035f;
+    private boolean applySmooth(Selection selection, float strength) {
+        // Sculpt "Smooth" should visibly relax the surface. The old nearly
+        // cancelling Taubin +/- pair was useful as a fairing filter but made a
+        // finger stroke feel inert. Use two positive Laplacian relaxations at
+        // controlled strength; a little local shrink is expected for this tool.
+        float factor = clamp(strength * 18f, 0.10f, 0.62f);
+        boolean changed = false;
+        for (int pass = 0; pass < 2; pass++) {
+            System.arraycopy(positions, 0, beforeScratch, 0, positions.length);
+            Arrays.fill(deltaScratch, 0f);
 
-        boolean first = smoothPass(selection, lambda);
-        boolean second = smoothPass(selection, mu);
-        return first || second;
-    }
+            boolean anyDelta = false;
+            for (int s = 0; s < selection.count; s++) {
+                int vertex = selection.vertices[s];
+                int[] adjacent = neighbors[vertex];
+                if (adjacent.length == 0) continue;
 
-    private boolean smoothPass(Selection selection, float factor) {
-        System.arraycopy(positions, 0, beforeScratch, 0, positions.length);
-        Arrays.fill(deltaScratch, 0f);
+                float ax = 0f, ay = 0f, az = 0f;
+                for (int nb : adjacent) {
+                    int n = nb * 3;
+                    ax += beforeScratch[n];
+                    ay += beforeScratch[n + 1];
+                    az += beforeScratch[n + 2];
+                }
+                float inv = 1f / adjacent.length;
+                ax *= inv;
+                ay *= inv;
+                az *= inv;
 
-        boolean anyDelta = false;
-        for (int s = 0; s < selection.count; s++) {
-            int vertex = selection.vertices[s];
-            int[] adjacent = neighbors[vertex];
-            if (adjacent.length == 0) continue;
+                int base = vertex * 3;
+                float localFactor = factor * selection.weights[s] * 0.5f;
+                float dx = (ax - beforeScratch[base]) * localFactor;
+                float dy = (ay - beforeScratch[base + 1]) * localFactor;
+                float dz = (az - beforeScratch[base + 2]) * localFactor;
 
-            float ax = 0f, ay = 0f, az = 0f;
-            for (int nb : adjacent) {
-                int n = nb * 3;
-                ax += beforeScratch[n];
-                ay += beforeScratch[n + 1];
-                az += beforeScratch[n + 2];
+                float moveLen = length(dx, dy, dz);
+                float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
+                float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
+                float maxMove = Math.max(
+                        0.00035f,
+                        Math.min(currentEdge * 0.13f, restEdge * 0.16f)
+                );
+                if (moveLen > maxMove && moveLen > 1e-8f) {
+                    float k = maxMove / moveLen;
+                    dx *= k;
+                    dy *= k;
+                    dz *= k;
+                }
+
+                deltaScratch[base] = dx;
+                deltaScratch[base + 1] = dy;
+                deltaScratch[base + 2] = dz;
+                anyDelta |= Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 1e-9f;
             }
 
-            float inv = 1f / adjacent.length;
-            ax *= inv;
-            ay *= inv;
-            az *= inv;
-
-            int base = vertex * 3;
-            float scale = factor * selection.weights[s];
-            float dx = (ax - beforeScratch[base]) * scale;
-            float dy = (ay - beforeScratch[base + 1]) * scale;
-            float dz = (az - beforeScratch[base + 2]) * scale;
-
-            float moveLen = length(dx, dy, dz);
-            float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
-            float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
-            float maxMove = Math.max(
-                    0.00035f,
-                    Math.min(currentEdge * 0.09f, restEdge * 0.12f)
-            );
-            if (moveLen > maxMove && moveLen > 1e-8f) {
-                float k = maxMove / moveLen;
-                dx *= k;
-                dy *= k;
-                dz *= k;
+            if (anyDelta && commitTransactional(selection, beforeScratch, deltaScratch)) {
+                changed = true;
+                recalculateNormals();
+            } else {
+                break;
             }
-
-            deltaScratch[base] = dx;
-            deltaScratch[base + 1] = dy;
-            deltaScratch[base + 2] = dz;
-            anyDelta |= Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 1e-9f;
         }
-
-        return anyDelta && commitTransactional(selection, beforeScratch, deltaScratch);
+        return changed;
     }
+
+
 
     private boolean commitTransactional(Selection selection, float[] before, float[] delta) {
         int touchedCount = collectTouchedTriangles(selection);
@@ -767,6 +1005,248 @@ final class SculptMesh {
 
         float t = (e2x * qx + e2y * qy + e2z * qz) * invDet;
         return t > epsilon ? t : -1f;
+    }
+
+    boolean isClosedTwoManifold() {
+        Map<Long, Integer> counts = new HashMap<>();
+        for (int i = 0; i < indices.length; i += 3) {
+            addEdgeCount(counts, indices[i], indices[i + 1]);
+            addEdgeCount(counts, indices[i + 1], indices[i + 2]);
+            addEdgeCount(counts, indices[i + 2], indices[i]);
+        }
+        for (int count : counts.values()) {
+            if (count != 2) return false;
+        }
+        return !counts.isEmpty();
+    }
+
+    private static void addEdgeCount(Map<Long, Integer> counts, int a, int b) {
+        int min = Math.min(a, b);
+        int max = Math.max(a, b);
+        long key = (((long) min) << 32) | (max & 0xffffffffL);
+        counts.put(key, counts.getOrDefault(key, 0) + 1);
+    }
+
+    private static int gridId(int i, int j, int k, int nx, int ny) {
+        return (k * ny + j) * nx + i;
+    }
+
+    private static void polygonizeTetra(
+            int[] tet,
+            float[] gridPositions,
+            float[] field,
+            Map<Long, Integer> edgeCache,
+            List<float[]> vertices,
+            List<int[]> faces
+    ) {
+        boolean[] inside = new boolean[4];
+        int insideCount = 0;
+        for (int i = 0; i < 4; i++) {
+            inside[i] = field[tet[i]] < 0f;
+            if (inside[i]) insideCount++;
+        }
+        if (insideCount == 0 || insideCount == 4) return;
+
+        if (insideCount == 1 || insideCount == 3) {
+            boolean seekInside = insideCount == 1;
+            int single = -1;
+            int[] others = new int[3];
+            int out = 0;
+            for (int i = 0; i < 4; i++) {
+                if (inside[i] == seekInside) single = i;
+                else others[out++] = i;
+            }
+
+            int a = humanEdgeVertex(tet[single], tet[others[0]], gridPositions, field, edgeCache, vertices);
+            int b = humanEdgeVertex(tet[single], tet[others[1]], gridPositions, field, edgeCache, vertices);
+            int c = humanEdgeVertex(tet[single], tet[others[2]], gridPositions, field, edgeCache, vertices);
+            addHumanOrientedFace(vertices, faces, a, b, c);
+            return;
+        }
+
+        int[] ins = new int[2];
+        int[] outs = new int[2];
+        int inCount = 0;
+        int outCount = 0;
+        for (int i = 0; i < 4; i++) {
+            if (inside[i]) ins[inCount++] = i;
+            else outs[outCount++] = i;
+        }
+
+        int a = humanEdgeVertex(tet[ins[0]], tet[outs[0]], gridPositions, field, edgeCache, vertices);
+        int b = humanEdgeVertex(tet[ins[0]], tet[outs[1]], gridPositions, field, edgeCache, vertices);
+        int c = humanEdgeVertex(tet[ins[1]], tet[outs[0]], gridPositions, field, edgeCache, vertices);
+        int d = humanEdgeVertex(tet[ins[1]], tet[outs[1]], gridPositions, field, edgeCache, vertices);
+        addHumanOrientedFace(vertices, faces, a, c, b);
+        addHumanOrientedFace(vertices, faces, b, c, d);
+    }
+
+    private static int humanEdgeVertex(
+            int a,
+            int b,
+            float[] gridPositions,
+            float[] field,
+            Map<Long, Integer> cache,
+            List<float[]> vertices
+    ) {
+        int min = Math.min(a, b);
+        int max = Math.max(a, b);
+        long key = (((long) min) << 32) | (max & 0xffffffffL);
+        Integer cached = cache.get(key);
+        if (cached != null) return cached;
+
+        float fa = field[a];
+        float fb = field[b];
+        float denominator = fa - fb;
+        float t = Math.abs(denominator) > 1e-10f ? fa / denominator : 0.5f;
+
+        // Avoid pathological sliver triangles when the iso-surface passes
+        // numerically almost through a grid corner. This slightly quantizes
+        // the blockout surface but gives the sculpt core much healthier
+        // starting triangles on a low-resolution mobile grid.
+        t = clamp(t, 0.14f, 0.86f);
+
+        int pa = a * 3;
+        int pb = b * 3;
+        float x = lerp(gridPositions[pa], gridPositions[pb], t);
+        float y = lerp(gridPositions[pa + 1], gridPositions[pb + 1], t);
+        float z = lerp(gridPositions[pa + 2], gridPositions[pb + 2], t);
+
+        int index = vertices.size();
+        vertices.add(new float[]{x, y, z});
+        cache.put(key, index);
+        return index;
+    }
+
+    private static void addHumanOrientedFace(
+            List<float[]> vertices,
+            List<int[]> faces,
+            int a,
+            int b,
+            int c
+    ) {
+        if (a == b || b == c || c == a) return;
+        float[] pa = vertices.get(a);
+        float[] pb = vertices.get(b);
+        float[] pc = vertices.get(c);
+
+        float abx = pb[0] - pa[0];
+        float aby = pb[1] - pa[1];
+        float abz = pb[2] - pa[2];
+        float acx = pc[0] - pa[0];
+        float acy = pc[1] - pa[1];
+        float acz = pc[2] - pa[2];
+
+        float nx = aby * acz - abz * acy;
+        float ny = abz * acx - abx * acz;
+        float nz = abx * acy - aby * acx;
+        if (length(nx, ny, nz) < 1e-8f) return;
+
+        float cx = (pa[0] + pb[0] + pc[0]) / 3f;
+        float cy = (pa[1] + pb[1] + pc[1]) / 3f;
+        float cz = (pa[2] + pb[2] + pc[2]) / 3f;
+        float[] gradient = humanFieldGradient(cx, cy, cz);
+
+        if (nx * gradient[0] + ny * gradient[1] + nz * gradient[2] < 0f) {
+            faces.add(new int[]{a, c, b});
+        } else {
+            faces.add(new int[]{a, b, c});
+        }
+    }
+
+    private static float[] humanFieldGradient(float x, float y, float z) {
+        final float e = 0.004f;
+        return new float[]{
+                humanField(x + e, y, z) - humanField(x - e, y, z),
+                humanField(x, y + e, z) - humanField(x, y - e, z),
+                humanField(x, y, z + e) - humanField(x, y, z - e)
+        };
+    }
+
+    private static float humanField(float x, float y, float z) {
+        // Neutral game-character blockout: chest, pelvis, head, neck, arms,
+        // legs, hands and feet blended into one closed surface.
+        float d = sdEllipsoid(x, y, z, 0f, 0.28f, 0f, 0.47f, 0.72f, 0.28f);
+        d = smoothMin(d, sdEllipsoid(x, y, z, 0f, -0.42f, 0f, 0.42f, 0.38f, 0.30f), 0.10f);
+        d = smoothMin(d, sdCapsule(x, y, z, 0f, 0.72f, 0f, 0f, 0.93f, 0f, 0.18f), 0.10f);
+        d = smoothMin(d, sdEllipsoid(x, y, z, 0f, 1.25f, 0f, 0.33f, 0.42f, 0.32f), 0.10f);
+
+        for (int side = -1; side <= 1; side += 2) {
+            float s = side;
+            d = smoothMin(d, sdCapsule(
+                    x, y, z,
+                    s * 0.42f, 0.58f, 0f,
+                    s * 0.72f, -0.18f, 0f,
+                    0.14f
+            ), 0.10f);
+            d = smoothMin(d, sdCapsule(
+                    x, y, z,
+                    s * 0.72f, -0.18f, 0f,
+                    s * 0.68f, -0.70f, 0.02f,
+                    0.115f
+            ), 0.09f);
+            d = smoothMin(d, sdEllipsoid(
+                    x, y, z,
+                    s * 0.68f, -0.82f, 0.03f,
+                    0.13f, 0.20f, 0.11f
+            ), 0.08f);
+            d = smoothMin(d, sdCapsule(
+                    x, y, z,
+                    s * 0.20f, -0.56f, 0f,
+                    s * 0.24f, -1.28f, 0f,
+                    0.20f
+            ), 0.10f);
+            d = smoothMin(d, sdEllipsoid(
+                    x, y, z,
+                    s * 0.24f, -1.43f, 0.08f,
+                    0.20f, 0.19f, 0.32f
+            ), 0.08f);
+        }
+        return d;
+    }
+
+    private static float sdEllipsoid(
+            float x, float y, float z,
+            float cx, float cy, float cz,
+            float rx, float ry, float rz
+    ) {
+        float px = (x - cx) / rx;
+        float py = (y - cy) / ry;
+        float pz = (z - cz) / rz;
+        return (length(px, py, pz) - 1f) * Math.min(rx, Math.min(ry, rz));
+    }
+
+    private static float sdCapsule(
+            float x, float y, float z,
+            float ax, float ay, float az,
+            float bx, float by, float bz,
+            float radius
+    ) {
+        float pax = x - ax;
+        float pay = y - ay;
+        float paz = z - az;
+        float bax = bx - ax;
+        float bay = by - ay;
+        float baz = bz - az;
+        float denom = bax * bax + bay * bay + baz * baz;
+        float h = denom > 1e-10f
+                ? clamp((pax * bax + pay * bay + paz * baz) / denom, 0f, 1f)
+                : 0f;
+        return length(
+                pax - bax * h,
+                pay - bay * h,
+                paz - baz * h
+        ) - radius;
+    }
+
+    private static float smoothMin(float a, float b, float k) {
+        if (!(k > 0f)) return Math.min(a, b);
+        float h = clamp(0.5f + 0.5f * (b - a) / k, 0f, 1f);
+        return lerp(b, a, h) - k * h * (1f - h);
+    }
+
+    private static float lerp(float a, float b, float t) {
+        return a + (b - a) * t;
     }
 
     private static int[][] buildNeighbors(int vertexCount, int[] indices) {

@@ -18,6 +18,7 @@ public class MainActivity extends Activity {
     private Button subtractButton;
     private Button smoothButton;
     private Button symmetryButton;
+    private Button grabButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -49,7 +50,7 @@ public class MainActivity extends Activity {
         bar.setBackgroundResource(com.fallpoint.pocketsculpt.R.drawable.panel_bg);
 
         TextView title = new TextView(this);
-        title.setText("PocketSculpt  V1.2");
+        title.setText("PocketSculpt  V1.3");
         title.setTextColor(Color.WHITE);
         title.setTextSize(17f);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
@@ -78,6 +79,7 @@ public class MainActivity extends Activity {
         addButton = toolButton("Clay +", v -> selectMode(BrushMode.ADD));
         subtractButton = toolButton("Clay -", v -> selectMode(BrushMode.SUBTRACT));
         smoothButton = toolButton("Smooth", v -> selectMode(BrushMode.SMOOTH));
+        grabButton = toolButton("Grab", v -> selectMode(BrushMode.GRAB));
         symmetryButton = toolButton("Sym X", v -> toggleSymmetry());
 
         tools.addView(addButton, toolParams());
@@ -85,6 +87,8 @@ public class MainActivity extends Activity {
         tools.addView(subtractButton, toolParams());
         tools.addView(spacer(6));
         tools.addView(smoothButton, toolParams());
+        tools.addView(spacer(6));
+        tools.addView(grabButton, toolParams());
         tools.addView(spacer(6));
         tools.addView(symmetryButton, toolParams());
         panel.addView(tools);
@@ -96,7 +100,7 @@ public class MainActivity extends Activity {
         panel.addView(strengthRow);
 
         TextView help = new TextView(this);
-        help.setText("1 finger: sculpt   •   2 fingers: orbit / pinch zoom");
+        help.setText("Clay builds/cuts  •  Grab shapes  •  2 fingers orbit / zoom");
         help.setTextColor(Color.rgb(185, 192, 199));
         help.setTextSize(12f);
         help.setGravity(Gravity.CENTER);
@@ -139,6 +143,7 @@ public class MainActivity extends Activity {
         styleTool(addButton, mode == BrushMode.ADD);
         styleTool(subtractButton, mode == BrushMode.SUBTRACT);
         styleTool(smoothButton, mode == BrushMode.SMOOTH);
+        styleTool(grabButton, mode == BrushMode.GRAB);
     }
 
     private void toggleSymmetry() {
@@ -154,7 +159,7 @@ public class MainActivity extends Activity {
 
     private Button toolButton(String text, View.OnClickListener listener) {
         Button button = actionButton(text, listener);
-        button.setTextSize(12f);
+        button.setTextSize(11f);
         button.setAllCaps(false);
         return button;
     }
