@@ -47,7 +47,7 @@ public class MainActivity extends Activity {
         bar.setBackgroundResource(R.drawable.panel_bg);
 
         TextView title = new TextView(this);
-        title.setText("CABrush Core 0.3.1");
+        title.setText("CABrush AVS 0.1");
         title.setTextColor(Color.WHITE);
         title.setTextSize(17f);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
@@ -88,7 +88,7 @@ public class MainActivity extends Activity {
         ));
 
         TextView help = new TextView(this);
-        help.setText("1 finger sculpt  •  2 fingers orbit / pinch zoom");
+        help.setText("AVS volume clay  •  2 fingers orbit / pinch zoom");
         help.setTextColor(Color.rgb(185, 192, 199));
         help.setTextSize(12f);
         help.setGravity(Gravity.CENTER);

@@ -1,87 +1,66 @@
 package com.fallpoint.pocketsculpt;
 
 /**
- * Runtime facade kept intentionally thin. Core 0.3 truth lives in MeshKernel;
- * brushes, BVH, transactions and render staging are separate subsystems.
+ * Thin runtime facade for CABrush AVS 0.1.
+ *
+ * The signed-distance volume is sculpt truth. AvsSurfaceCache is disposable
+ * rendering cache and can be rebuilt at any time.
  */
 final class SculptMesh {
     static final class Hit {
-        float x, y, z, nx, ny, nz, t;
-        int faceId;
-
-        Hit set(SculptBvh.RayHit hit) {
-            x = hit.x; y = hit.y; z = hit.z;
-            nx = hit.nx; ny = hit.ny; nz = hit.nz;
-            t = hit.t; faceId = hit.faceId;
+        float x,y,z,nx,ny,nz,t;
+        Hit set(AvsVolume.RayHit h) {
+            x=h.x; y=h.y; z=h.z; nx=h.nx; ny=h.ny; nz=h.nz; t=h.t;
             return this;
         }
     }
 
-    final MeshKernel kernel;
-    final SculptBvh bvh;
-    final SculptEngine sculptEngine;
-    final RenderChunkBuilder renderChunks;
-
-    private final MeshSnapshot resetSnapshot;
-    private final SculptBvh.RayHit rayScratch = new SculptBvh.RayHit();
+    final AvsVolume volume;
+    final AvsSurfaceCache surface;
+    private final AvsSnapshot resetSnapshot;
+    private final AvsVolume.RayHit rayScratch = new AvsVolume.RayHit();
     private final Hit hitScratch = new Hit();
-    private final StrokeContext strokeScratch = new StrokeContext();
 
-    private SculptMesh(MeshKernel kernel) {
-        this.kernel = kernel;
-        this.resetSnapshot = MeshSnapshot.capture(kernel);
-        this.bvh = new SculptBvh(kernel);
-        this.sculptEngine = new SculptEngine(kernel, bvh);
-        this.renderChunks = new RenderChunkBuilder(kernel);
+    private SculptMesh(AvsVolume volume) {
+        this.volume = volume;
+        this.surface = new AvsSurfaceCache(volume);
+        this.resetSnapshot = volume.snapshot();
+        this.surface.rebuildAll();
     }
 
     static SculptMesh createSphere() {
-        return new SculptMesh(MeshKernel.createIcoSphere(4, 1f));
+        return new SculptMesh(AvsVolume.createSphere(1f));
     }
 
     Hit raycast(float[] origin, float[] direction) {
         if (origin == null || direction == null || origin.length < 3 || direction.length < 3) return null;
-        SculptBvh.RayHit hit = bvh.raycast(
-                origin[0], origin[1], origin[2],
-                direction[0], direction[1], direction[2],
+        AvsVolume.RayHit h = volume.raycast(
+                origin[0],origin[1],origin[2],
+                direction[0],direction[1],direction[2],
                 rayScratch
         );
-        return hit.faceId == MeshKernel.INVALID ? null : hitScratch.set(hit);
+        return h.hit ? hitScratch.set(h) : null;
     }
 
-    boolean applyClay(
-            float hitX, float hitY, float hitZ,
-            float normalX, float normalY, float normalZ,
-            float[] viewDirection,
-            float radius, float strength, BrushMode mode,
-            float accumulatedDistance,
-            int hitFace
-    ) {
-        if (viewDirection == null || viewDirection.length < 3) return false;
-        strokeScratch.set(
-                hitX, hitY, hitZ,
-                normalX, normalY, normalZ,
-                viewDirection[0], viewDirection[1], viewDirection[2],
-                radius, strength, accumulatedDistance, mode, hitFace
+    boolean applyClay(float hitX,float hitY,float hitZ,
+                      float normalX,float normalY,float normalZ,
+                      float radius,float strength,BrushMode mode) {
+        AvsVolume.BrushResult r = volume.applyClay(
+                hitX,hitY,hitZ,normalX,normalY,normalZ,radius,strength,mode
         );
-        return sculptEngine.applyClay(strokeScratch);
+        return r.changed;
     }
 
     void reset() {
-        resetSnapshot.restoreInto(kernel);
-        bvh.rebuild();
-        renderChunks.rebuild();
+        resetSnapshot.restoreInto(volume);
+        surface.rebuildAll();
     }
 
-    RenderChunkBuilder.RenderPlan renderPlan() {
-        return renderChunks.currentPlan();
+    AvsSurfaceCache.RenderPlan renderPlan() {
+        return surface.currentPlan();
     }
 
-    GeometryValidator.Report validate() {
-        return GeometryValidator.validate(kernel, true);
-    }
+    AvsVolume.Stats stats() { return volume.stats(); }
 
-    MeshSnapshot snapshot() {
-        return MeshSnapshot.capture(kernel);
-    }
+    String fieldHash() { return volume.fieldHash(); }
 }

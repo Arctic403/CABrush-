@@ -6,7 +6,7 @@ on:
     branches: [ "main" ]
 
 concurrency:
-  group: cabrush-main-verify
+  group: cabrush-main-avs-verify
   cancel-in-progress: true
 
 jobs:
@@ -30,15 +30,14 @@ jobs:
       - name: Install SDK 35
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
-      # app:preBuild is hard-gated by Core 0.3.1 VSS.
-      - name: Core verification + APK build
+      - name: AVS verification + APK build
         run: gradle assembleDebug
 
-      - name: Upload VSS dump and screenshots
+      - name: Upload AVS VSS dump and screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CABrush-Core-0.3.1-VSS
+          name: CABrush-AVS-0.1-VSS
           path: app/build/vss/report/**
           if-no-files-found: warn
 
@@ -46,5 +45,5 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: CABrush-core-0.3.1-debug
+          name: CABrush-AVS-0.1-debug
           path: app/build/outputs/apk/debug/app-debug.apk

@@ -1,105 +1,129 @@
-# CABrush Core 0.3.1
+# CABrush AVS 0.1
 
-CABrush Core 0.3.1 is a **geometry-truth hardening milestone**. Runtime scope stays intentionally tiny: one sphere, Clay+, Clay-, Size, Strength, Reset, orbit, and pinch zoom.
+CABrush has pivoted away from mutable-triangle sculpting.
 
-The goal of this patch is not to make more brushes. It is to stop the engine from calling visibly broken geometry "valid".
+**The mesh is no longer the sculpt.**
 
-## What Core 0.3.1 changes
+AVS (Adaptive Volume Surface) stores the model as a sparse signed-distance
+volume. Triangles are disposable render cache generated from that field.
 
-### Geometry truth
-`GeometryValidator` now separates structural validity from sculpt-safe geometry.
+Runtime stays intentionally tiny:
 
-It still verifies:
-- finite coordinates
-- valid vertex/face references
-- nondegenerate triangles
-- duplicate faces / directed edges
-- closed two-manifold incidence
-- half-edge twin consistency
-- 32-bit resource guards
+- one sphere
+- Clay +
+- Clay -
+- Size
+- Strength
+- Reset
+- one-finger sculpt
+- two-finger orbit
+- pinch zoom
 
-It now also enforces:
-- stronger triangle-quality and edge-ratio floors
-- bounded face-normal change
-- bounded per-topology-edit surface area drift
-- bounded per-topology-edit closed-volume drift
-- local self-intersection rejection for changed topology
-- closed-manifold edge-collapse link condition
-- placement-quality / surface-envelope rejection reasons
+No Smooth, Grab, masks, layers, import/export, DynTopo, remesh UI or character
+tooling is in this milestone.
 
-### Topology operators
-`GeometryOps` is now conservative by design.
+## Why AVS
 
-- `splitEdge()` preserves the piecewise-linear surface and rejects pathological child triangles.
-- `collapseEdge()` requires the closed-manifold link condition, only accepts short remeshing-style edges, and scores keep/remove/midpoint placements using local triangle quality and normal preservation.
-- `flipEdge()` is allowed to decline. It only commits when the new diagonal preserves or improves local conditioning and stays inside a bounded normal/edge envelope.
-- topology transactions run the full structural validator plus the geometry-transition validator before commit.
+The old Core 0.3.x architecture could keep a triangle mesh structurally valid,
+but a sculpt brush still had to fight edge stretch, collapse quality, flips and
+topology saturation.
 
-This follows the important remeshing distinction: topology legality alone is not enough. A mutation also has to preserve the geometric embedding.
+AVS moves that responsibility out of every brush.
 
-### Clay smoke consumer
-Clay remains a **test consumer**, not a production brush.
+The source-of-truth pipeline is:
 
-The Core 0.3 screenshots showed repeated Clay+ narrowing into a long extrusion. Core 0.3.1 changes the smoke consumer to a plane-aware Clay buildup:
-- tangent-plane footprint instead of raw 3D tip distance
-- an offset sculpt plane instead of unlimited Draw-style displacement
-- broad surrounding support stays involved as volume accumulates
+    touch/ray
+      -> sparse signed-distance bricks
+      -> local CSG field edit
+      -> mark neighboring bricks dirty
+      -> conforming volume extractor rebuilds only dirty surface chunks
+      -> OpenGL renders disposable chunks
 
-Fixed topology will still saturate. That is now reported explicitly rather than hidden. Production Clay tuning waits until adaptive topology/remeshing returns on top of this kernel.
+Clay never directly moves a mesh vertex.
 
-## VSS v3
+## Sparse field
 
-Every Android build is still hard-gated by `vssVerify`.
+`AvsVolume` uses:
 
-VSS now checks **geometry quality, not only data-structure survival**:
+- 8x8x8 samples per brick
+- signed 16-bit fixed-point distance samples
+- one globally-owned lattice sample per coordinate
+- positive background outside allocated bricks
+- negative values inside the sculpt
+- 0 as the surface
+- deterministic primitive-key lookup
+- hard 12,000-brick guard for the 32-bit Android prototype
 
-- baseline kernel/manifold/connectivity
-- split / flip-rejection / safe-collapse atomic behavior
-- 1,500 topology mutations using remeshing-style long-edge split / short-edge collapse selection
-- shape-envelope checks every 50 topology operations
-- surface area drift
-- signed-volume drift
-- radial envelope
-- maximum edge growth
-- minimum triangle quality
-- explicit self-intersection detection with a known folded mesh
-- invalid-edit bit-exact rollback
-- deterministic snapshot round trip
-- BVH raycasts against brute-force reference raycasts
-- BVH refit after deformation
-- 16-bit render chunk correctness on a 163k-vertex mesh
-- deterministic topology replay by SHA-256
-- 1,050 Clay +/- smoke operations with progression screenshots and rejection-reason telemetry
-- scale/memory tiers at ~2.5k, 10k, 41k, and 164k vertices
-- p50/p95/p99 timing for raycasts, topology transactions, and snapshots
+At 512 samples x 2 bytes, raw SDF payload is exactly 1 KiB per allocated brick
+before small Java/lookup metadata.
 
-VSS emits `cabrush-core-dump-v3` plus screenshots and a contact sheet.
+The initial sphere allocates only a compact brick region around its volume.
+Clay+ allocates new bricks as the shape grows. Empty world space costs nothing.
 
-The topology fuzz is now required to stay close to its starting surface. A mesh can no longer pass just because every edge has two incident faces while the visible surface has turned into shards.
+## Clay
 
-## Evidence from the local Core 0.3.1 verification
+Clay is volume CSG:
 
-The final dependency-free Java verification passed all 12 scenarios.
+- Clay+ unions a sphere-shaped field into the sculpt
+- Clay- subtracts it
 
-The 1,500-op topology fuzz finished at:
-- 187 vertices
-- 370 faces
-- ~1.5% surface-area drift
-- ~3.0% signed-volume drift
-- minimum triangle quality ~0.596
-- radial range ~0.938 to 1.000
-- zero detected self-intersections at verification checkpoints
+A touch ray intersects the SDF itself, not the generated triangles. The brush
+sphere is positioned so only a controlled depth overlaps the current surface.
+Repeated strokes can therefore keep extending the volume instead of exhausting
+an original triangle edge budget.
 
-The 164k-vertex scale tier remains roughly:
-- ~30.5 MiB kernel
-- ~26.5 MiB BVH
-- ~12.1 MiB render staging
+## Surface cache
 
-That is why 500k vertices remains a **hard guard**, not a normal mobile working target. Around 100k-250k is the intended future working range until real-device evidence justifies more.
+`AvsSurfaceCache` uses a globally conforming six-tetrahedra split per grid cell and Marching Tetrahedra.
+
+Each dirty 8-cell brick gets a one-cell ghost apron while meshing. Adjacent
+chunks read identical global SDF samples, so their boundary vertices are
+computed from the same data.
+
+Each render chunk has its own local 16-bit indices and is far below 65,535
+vertices. The renderer tracks chunk revisions by brick ID, so unchanged chunks
+do not need to be regenerated after a local brush edit.
+
+The render mesh can be deleted and regenerated without losing the sculpt.
+
+## AVS VSS
+
+Every Android build is gated by the dependency-free AVS verifier.
+
+The test suite checks:
+
+- initial SDF sign and sphere raycast
+- generated closed surface after weld-by-position verification
+- repeated Clay+ monotonic growth without fixed-topology saturation
+- Clay- volume removal
+- thousands of deterministic mixed CSG stamps
+- sparse brick budget
+- dirty-chunk locality
+- snapshot bit-exact restoration
+- deterministic field replay/hash
+- raycast correctness after heavy edits
+- surface-chunk seam closure after heavy edits
+- extraction/raycast timing telemetry
+- raw field/render-cache memory telemetry
+- progression screenshots and contact sheet
+
+Artifacts:
+
+- `dump.json` (`cabrush-avs-dump-v1`)
+- `dump.txt`
+- baseline screenshot
+- Clay+ growth checkpoints
+- Clay- result
+- mixed CSG stress result
+- contact sheet
+
+`app:preBuild` depends on `vssVerify`, so an APK is not packaged when AVS
+verification fails.
 
 ## Build
 
 Requirements:
+
 - JDK 17
 - Gradle 8.7
 - Android SDK 35
@@ -114,22 +138,31 @@ Verification only:
     gradle :app:vssVerify
 
 Artifacts:
+
 - APK: `app/build/outputs/apk/debug/app-debug.apk`
 - VSS: `app/build/vss/report/`
 
 ## Android / ABI
 
-The current project remains Java + Android SDK + OpenGL ES 3.0 with no native `.so` libraries, so there is no native ABI split yet.
+AVS 0.1 is still Java + Android SDK + OpenGL ES 3.0 and contains no native
+`.so` libraries, so the current core has no ABI split.
 
-Any future native layer must preserve:
+Any future native acceleration layer must preserve both:
+
 - `armeabi-v7a`
 - `arm64-v8a`
 
-## Still deliberately not in the app
+## What comes after this proof
 
-No Smooth, Grab, human base, DynTopo UI, remesh UI, masks, layers, import/export, or character tooling yet.
+AVS 0.1 is deliberately a single-resolution sparse field. It proves the new
+source-of-truth model first.
 
-The next feature work should happen only after:
-1. Core 0.3.1 VSS is green in GitHub Actions.
-2. The VSS screenshots/dump are inspected.
-3. The new build survives long sculpt sessions on the real 32-bit phone.
+Only after the real 32-bit phone and CI evidence are clean should we add:
+
+1. adaptive brick resolution / detail levels
+2. Smooth as an SDF filter
+3. Grab as local field warping
+4. higher-quality detail extraction / sharp-feature strategy
+5. displacement/detail tiles for micro detail
+
+That keeps CABrush's core simple: sculpt the field, regenerate the surface.
