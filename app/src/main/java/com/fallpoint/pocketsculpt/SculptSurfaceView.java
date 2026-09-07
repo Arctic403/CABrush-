@@ -54,6 +54,16 @@ public class SculptSurfaceView extends GLSurfaceView {
     }
 
     @Override
+    public void onPause() {
+        // Finish an in-flight stroke before the GL thread pauses. Without this,
+        // an app switch can leave strokeActive latched and the next touch is
+        // ignored because beginStroke() thinks the old stroke is still active.
+        queueEvent(renderer::endStroke);
+        twoFingerGesture = false;
+        super.onPause();
+    }
+
+    @Override
     public boolean onTouchEvent(MotionEvent event) {
         final int action = event.getActionMasked();
         final int count = event.getPointerCount();
@@ -79,15 +89,14 @@ public class SculptSurfaceView extends GLSurfaceView {
                 twoFingerGesture = true;
                 handleTwoFinger(event);
             } else if (!twoFingerGesture) {
-                float x = event.getX();
-                float y = event.getY();
-                float dx = x - lastSingleX;
-                float dy = y - lastSingleY;
-                if (dx * dx + dy * dy >= 9f) {
-                    sculptAt(x, y);
-                    lastSingleX = x;
-                    lastSingleY = y;
+                // Android may batch several touch samples into one ACTION_MOVE.
+                // Consume the historical path first so curved strokes do not get
+                // replaced by one long straight chord on slower devices.
+                int history = event.getHistorySize();
+                for (int h = 0; h < history; h++) {
+                    consumeSingleSample(event.getHistoricalX(0, h), event.getHistoricalY(0, h));
                 }
+                consumeSingleSample(event.getX(), event.getY());
             }
             return true;
         }
@@ -107,6 +116,15 @@ public class SculptSurfaceView extends GLSurfaceView {
         }
 
         return true;
+    }
+
+    private void consumeSingleSample(float x, float y) {
+        float dx = x - lastSingleX;
+        float dy = y - lastSingleY;
+        if (dx * dx + dy * dy < 9f) return;
+        sculptAt(x, y);
+        lastSingleX = x;
+        lastSingleY = y;
     }
 
     private void sculptAt(float x, float y) {

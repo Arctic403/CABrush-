@@ -1,6 +1,5 @@
 package com.fallpoint.pocketsculpt;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -14,9 +13,37 @@ final class SculptMesh {
     final float[] normals;
     final int[] indices;
 
+    // Fixed-topology guard rails. These deliberately trade extreme deformation
+    // for a mesh that remains usable until dynamic remeshing is implemented.
+    private static final float MAX_EDGE_STRETCH = 2.35f;
+    private static final float MIN_EDGE_COMPRESSION = 0.38f;
+    private static final float MIN_REST_AREA_RATIO = 0.16f;
+    private static final float MIN_STEP_AREA_RATIO = 0.52f;
+    private static final float MIN_STEP_NORMAL_DOT = 0.32f;
+    private static final float MIN_TRIANGLE_QUALITY = 0.10f;
+    private static final float MAX_STEP_EDGE_GROWTH = 1.28f;
+    private static final float MIN_STEP_EDGE_SHRINK = 0.76f;
+    private static final int MAX_LINE_SEARCH_STEPS = 7;
+
     private final float[] originalPositions;
     private final int[][] neighbors;
     private final int[][] incidentTriangles;
+    private final float[] restTriangleArea2;
+
+    // Reused transaction buffers keep the safety pass from creating several
+    // full-mesh garbage objects for every brush dab on low-memory phones.
+    private final float[] beforeScratch;
+    private final float[] candidateScratch;
+    private final float[] deltaScratch;
+    private final boolean[] touchedTriangleMask;
+    private final int[] touchedTriangles;
+    private final int[] traversalStamp;
+    private final int[] traversalQueue;
+    private final int[] selectionVerticesScratch;
+    private final float[] selectionWeightsScratch;
+    private final float[] normalScratchOld = new float[3];
+    private final float[] normalScratchNew = new float[3];
+    private int traversalGeneration = 1;
 
     static final class Hit {
         final float x, y, z;
@@ -41,12 +68,31 @@ final class SculptMesh {
         this.normals = new float[positions.length];
         this.neighbors = buildNeighbors(positions.length / 3, indices);
         this.incidentTriangles = buildIncidentTriangles(positions.length / 3, indices);
+        this.restTriangleArea2 = new float[indices.length / 3];
+
+        this.beforeScratch = new float[positions.length];
+        this.candidateScratch = new float[positions.length];
+        this.deltaScratch = new float[positions.length];
+        this.touchedTriangleMask = new boolean[indices.length / 3];
+        this.touchedTriangles = new int[indices.length / 3];
+        int vertexCount = positions.length / 3;
+        this.traversalStamp = new int[vertexCount];
+        this.traversalQueue = new int[vertexCount];
+        this.selectionVerticesScratch = new int[vertexCount];
+        this.selectionWeightsScratch = new float[vertexCount];
+
+        for (int triangle = 0; triangle < restTriangleArea2.length; triangle++) {
+            restTriangleArea2[triangle] = triangleArea2(originalPositions, triangle);
+        }
         recalculateNormals();
     }
 
     static SculptMesh createIcoSphere(int subdivisions, float radius) {
         if (subdivisions < 0 || subdivisions > 6) {
             throw new IllegalArgumentException("subdivisions must be in [0, 6]");
+        }
+        if (!(radius > 0f) || !Float.isFinite(radius)) {
+            throw new IllegalArgumentException("radius must be finite and > 0");
         }
 
         final float t = (1f + (float) Math.sqrt(5.0)) * 0.5f;
@@ -113,7 +159,7 @@ final class SculptMesh {
         return new SculptMesh(outPositions, outIndices);
     }
 
-    void applyBrush(
+    boolean applyBrush(
             float cx, float cy, float cz,
             float hitNx, float hitNy, float hitNz,
             float[] viewDirection,
@@ -122,26 +168,32 @@ final class SculptMesh {
             BrushMode mode,
             boolean frontFaceOnly
     ) {
-        if (radius <= 0f || strength <= 0f) return;
+        if (!(radius > 0f) || !(strength > 0f)) return false;
+        if (!allFinite(cx, cy, cz, hitNx, hitNy, hitNz, radius, strength)) return false;
 
         Selection selection = collectSelection(
                 cx, cy, cz,
+                hitNx, hitNy, hitNz,
                 radius,
                 viewDirection,
                 frontFaceOnly
         );
-        if (selection.count == 0) return;
+        if (selection.count == 0) return false;
 
         if (mode == BrushMode.SMOOTH) {
-            applyTaubinSmooth(selection, strength);
-            return;
+            return applyTaubinSmooth(selection, strength);
         }
 
+        System.arraycopy(positions, 0, beforeScratch, 0, positions.length);
+        Arrays.fill(deltaScratch, 0f);
+
+        // Blender's Draw brush direction is based on the average normal in the
+        // active area. Use the same broad behavior, but keep it oriented with
+        // the ray-hit face so a damaged/stale vertex normal cannot reverse it.
         float nx = 0f, ny = 0f, nz = 0f, total = 0f;
-        for (int i = 0; i < selection.vertices.length; i++) {
-            int vertex = selection.vertices[i];
-            if (vertex < 0) break;
-            float w = selection.weights[i];
+        for (int s = 0; s < selection.count; s++) {
+            int vertex = selection.vertices[s];
+            float w = selection.weights[s];
             int base = vertex * 3;
             nx += normals[base] * w;
             ny += normals[base + 1] * w;
@@ -166,7 +218,7 @@ final class SculptMesh {
             nz = hitNz;
             nLen = length(nx, ny, nz);
         }
-        if (nLen < 1e-6f) return;
+        if (nLen < 1e-6f) return false;
         nx /= nLen;
         ny /= nLen;
         nz /= nLen;
@@ -184,25 +236,34 @@ final class SculptMesh {
         }
 
         float sign = mode == BrushMode.ADD ? 1f : -1f;
+        boolean anyDelta = false;
 
-        for (int i = 0; i < selection.vertices.length; i++) {
-            int vertex = selection.vertices[i];
-            if (vertex < 0) break;
+        for (int s = 0; s < selection.count; s++) {
+            int vertex = selection.vertices[s];
+            int base = vertex * 3;
 
-            float amount = strength * selection.weights[i] * sign;
-            float maxMove = Math.max(0.0005f, minNeighborEdgeLength(vertex) * 0.18f);
+            float amount = strength * selection.weights[s] * sign;
+            float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
+            float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
+            float maxMove = Math.max(
+                    0.00035f,
+                    Math.min(currentEdge * 0.11f, restEdge * 0.14f)
+            );
             amount = clamp(amount, -maxMove, maxMove);
 
-            moveVertexSafely(
-                    vertex,
-                    nx * amount,
-                    ny * amount,
-                    nz * amount
-            );
+            deltaScratch[base] = nx * amount;
+            deltaScratch[base + 1] = ny * amount;
+            deltaScratch[base + 2] = nz * amount;
+            anyDelta |= Math.abs(amount) > 1e-9f;
         }
+
+        return anyDelta && commitTransactional(selection, beforeScratch, deltaScratch);
     }
 
     Hit raycast(float[] origin, float[] direction) {
+        if (origin == null || direction == null || origin.length < 3 || direction.length < 3) return null;
+        if (!allFinite(origin[0], origin[1], origin[2], direction[0], direction[1], direction[2])) return null;
+
         float closestT = Float.POSITIVE_INFINITY;
         Hit best = null;
 
@@ -236,6 +297,8 @@ final class SculptMesh {
             ny /= len;
             nz /= len;
 
+            // The nearest visible hit should already be outward-facing on a
+            // healthy closed mesh. Orient defensively toward the camera ray.
             if (nx * direction[0] + ny * direction[1] + nz * direction[2] > 0f) {
                 nx = -nx;
                 ny = -ny;
@@ -283,10 +346,14 @@ final class SculptMesh {
             float y = normals[i + 1];
             float z = normals[i + 2];
             float len = length(x, y, z);
-            if (len > 1e-8f) {
+            if (len > 1e-8f && Float.isFinite(len)) {
                 normals[i] = x / len;
                 normals[i + 1] = y / len;
                 normals[i + 2] = z / len;
+            } else {
+                normals[i] = 0f;
+                normals[i + 1] = 0f;
+                normals[i + 2] = 0f;
             }
         }
     }
@@ -296,7 +363,10 @@ final class SculptMesh {
     }
 
     void setPositions(float[] snapshot) {
-        if (snapshot.length != positions.length) return;
+        if (snapshot == null || snapshot.length != positions.length) return;
+        for (float value : snapshot) {
+            if (!Float.isFinite(value)) return;
+        }
         System.arraycopy(snapshot, 0, positions, 0, positions.length);
     }
 
@@ -304,8 +374,19 @@ final class SculptMesh {
         System.arraycopy(originalPositions, 0, positions, 0, positions.length);
     }
 
+    boolean isHealthy() {
+        for (float value : positions) {
+            if (!Float.isFinite(value)) return false;
+        }
+        for (int triangle = 0; triangle < indices.length / 3; triangle++) {
+            if (!validateTriangle(originalPositions, positions, triangle, false)) return false;
+        }
+        return true;
+    }
+
     private Selection collectSelection(
             float cx, float cy, float cz,
+            float hitNx, float hitNy, float hitNz,
             float radius,
             float[] viewDirection,
             boolean frontFaceOnly
@@ -315,6 +396,11 @@ final class SculptMesh {
         int seed = -1;
         float bestDistanceSq = Float.POSITIVE_INFINITY;
 
+        float hitLen = length(hitNx, hitNy, hitNz);
+        float hnx = hitLen > 1e-6f ? hitNx / hitLen : 0f;
+        float hny = hitLen > 1e-6f ? hitNy / hitLen : 0f;
+        float hnz = hitLen > 1e-6f ? hitNz / hitLen : 0f;
+
         for (int i = 0; i < count; i++) {
             int base = i * 3;
             float dx = positions[base] - cx;
@@ -323,6 +409,7 @@ final class SculptMesh {
             float d2 = dx * dx + dy * dy + dz * dz;
             if (d2 > radiusSq) continue;
             if (frontFaceOnly && !isFrontFacing(i, viewDirection)) continue;
+            if (hitLen > 1e-6f && !normalCompatible(i, hnx, hny, hnz)) continue;
 
             if (d2 < bestDistanceSq) {
                 bestDistanceSq = d2;
@@ -332,15 +419,15 @@ final class SculptMesh {
 
         if (seed < 0) return Selection.empty();
 
-        boolean[] visited = new boolean[count];
-        boolean[] selected = new boolean[count];
-        ArrayDeque<Integer> queue = new ArrayDeque<>();
-        queue.add(seed);
-        visited[seed] = true;
+        int generation = nextTraversalGeneration();
+        int head = 0;
+        int tail = 0;
+        traversalQueue[tail++] = seed;
+        traversalStamp[seed] = generation;
 
         int selectedCount = 0;
-        while (!queue.isEmpty()) {
-            int i = queue.removeFirst();
+        while (head < tail) {
+            int i = traversalQueue[head++];
             int base = i * 3;
             float dx = positions[base] - cx;
             float dy = positions[base + 1] - cy;
@@ -349,38 +436,33 @@ final class SculptMesh {
 
             if (d2 > radiusSq) continue;
             if (frontFaceOnly && !isFrontFacing(i, viewDirection)) continue;
+            if (hitLen > 1e-6f && !normalCompatible(i, hnx, hny, hnz)) continue;
 
-            selected[i] = true;
+            float distance = (float) Math.sqrt(d2);
+            float u = clamp(1f - distance / radius, 0f, 1f);
+            float falloff = u * u * (3f - 2f * u);
+            selectionVerticesScratch[selectedCount] = i;
+            selectionWeightsScratch[selectedCount] = falloff;
             selectedCount++;
 
             for (int nb : neighbors[i]) {
-                if (!visited[nb]) {
-                    visited[nb] = true;
-                    queue.addLast(nb);
+                if (traversalStamp[nb] != generation) {
+                    traversalStamp[nb] = generation;
+                    traversalQueue[tail++] = nb;
                 }
             }
         }
 
         if (selectedCount == 0) return Selection.empty();
+        return new Selection(selectionVerticesScratch, selectionWeightsScratch, selectedCount);
+    }
 
-        int[] vertices = new int[selectedCount];
-        float[] weights = new float[selectedCount];
-        int out = 0;
-        for (int i = 0; i < count; i++) {
-            if (!selected[i]) continue;
-            int base = i * 3;
-            float dx = positions[base] - cx;
-            float dy = positions[base + 1] - cy;
-            float dz = positions[base + 2] - cz;
-            float distance = (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
-            float u = clamp(1f - distance / radius, 0f, 1f);
-            float falloff = u * u * (3f - 2f * u);
-            vertices[out] = i;
-            weights[out] = falloff;
-            out++;
+    private int nextTraversalGeneration() {
+        if (traversalGeneration == Integer.MAX_VALUE) {
+            Arrays.fill(traversalStamp, 0);
+            traversalGeneration = 1;
         }
-
-        return new Selection(vertices, weights, selectedCount);
+        return traversalGeneration++;
     }
 
     private boolean isFrontFacing(int vertex, float[] viewDirection) {
@@ -389,22 +471,31 @@ final class SculptMesh {
         float facing = -(normals[base] * viewDirection[0]
                 + normals[base + 1] * viewDirection[1]
                 + normals[base + 2] * viewDirection[2]);
-        return facing > -0.08f;
+        return facing > 0.02f;
     }
 
-    private void applyTaubinSmooth(Selection selection, float strength) {
-        float lambda = clamp(strength * 8f, 0.04f, 0.35f);
-        float mu = -lambda * 1.02f;
-        smoothPass(selection, lambda);
-        smoothPass(selection, mu);
+    private boolean normalCompatible(int vertex, float hnx, float hny, float hnz) {
+        int base = vertex * 3;
+        float dot = normals[base] * hnx + normals[base + 1] * hny + normals[base + 2] * hnz;
+        // A wide cone still follows curved surfaces, but avoids grabbing a
+        // nearby sheet whose normals point mostly the other way after folding.
+        return dot > -0.20f;
     }
 
-    private void smoothPass(Selection selection, float factor) {
-        float[] snapshot = positions.clone();
-        float[] dx = new float[selection.count];
-        float[] dy = new float[selection.count];
-        float[] dz = new float[selection.count];
+    private boolean applyTaubinSmooth(Selection selection, float strength) {
+        float lambda = clamp(strength * 8f, 0.035f, 0.30f);
+        float mu = -lambda * 1.035f;
 
+        boolean first = smoothPass(selection, lambda);
+        boolean second = smoothPass(selection, mu);
+        return first || second;
+    }
+
+    private boolean smoothPass(Selection selection, float factor) {
+        System.arraycopy(positions, 0, beforeScratch, 0, positions.length);
+        Arrays.fill(deltaScratch, 0f);
+
+        boolean anyDelta = false;
         for (int s = 0; s < selection.count; s++) {
             int vertex = selection.vertices[s];
             int[] adjacent = neighbors[vertex];
@@ -413,9 +504,9 @@ final class SculptMesh {
             float ax = 0f, ay = 0f, az = 0f;
             for (int nb : adjacent) {
                 int n = nb * 3;
-                ax += snapshot[n];
-                ay += snapshot[n + 1];
-                az += snapshot[n + 2];
+                ax += beforeScratch[n];
+                ay += beforeScratch[n + 1];
+                az += beforeScratch[n + 2];
             }
 
             float inv = 1f / adjacent.length;
@@ -425,113 +516,158 @@ final class SculptMesh {
 
             int base = vertex * 3;
             float scale = factor * selection.weights[s];
-            dx[s] = (ax - snapshot[base]) * scale;
-            dy[s] = (ay - snapshot[base + 1]) * scale;
-            dz[s] = (az - snapshot[base + 2]) * scale;
+            float dx = (ax - beforeScratch[base]) * scale;
+            float dy = (ay - beforeScratch[base + 1]) * scale;
+            float dz = (az - beforeScratch[base + 2]) * scale;
 
-            float moveLen = length(dx[s], dy[s], dz[s]);
-            float maxMove = Math.max(0.0005f, minNeighborEdgeLengthFrom(snapshot, vertex) * 0.14f);
+            float moveLen = length(dx, dy, dz);
+            float currentEdge = minNeighborEdgeLengthFrom(beforeScratch, vertex);
+            float restEdge = minNeighborEdgeLengthFrom(originalPositions, vertex);
+            float maxMove = Math.max(
+                    0.00035f,
+                    Math.min(currentEdge * 0.09f, restEdge * 0.12f)
+            );
             if (moveLen > maxMove && moveLen > 1e-8f) {
                 float k = maxMove / moveLen;
-                dx[s] *= k;
-                dy[s] *= k;
-                dz[s] *= k;
+                dx *= k;
+                dy *= k;
+                dz *= k;
             }
+
+            deltaScratch[base] = dx;
+            deltaScratch[base + 1] = dy;
+            deltaScratch[base + 2] = dz;
+            anyDelta |= Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 1e-9f;
         }
 
+        return anyDelta && commitTransactional(selection, beforeScratch, deltaScratch);
+    }
+
+    private boolean commitTransactional(Selection selection, float[] before, float[] delta) {
+        int touchedCount = collectTouchedTriangles(selection);
+        if (touchedCount == 0) return false;
+
+        float scale = 1f;
+        for (int attempt = 0; attempt < MAX_LINE_SEARCH_STEPS; attempt++) {
+            System.arraycopy(before, 0, candidateScratch, 0, before.length);
+
+            for (int s = 0; s < selection.count; s++) {
+                int base = selection.vertices[s] * 3;
+                candidateScratch[base] = before[base] + delta[base] * scale;
+                candidateScratch[base + 1] = before[base + 1] + delta[base + 1] * scale;
+                candidateScratch[base + 2] = before[base + 2] + delta[base + 2] * scale;
+            }
+
+            if (validateTouchedTriangles(before, candidateScratch, touchedCount)) {
+                System.arraycopy(candidateScratch, 0, positions, 0, positions.length);
+                clearTouchedTriangles(touchedCount);
+                return true;
+            }
+            scale *= 0.5f;
+        }
+
+        clearTouchedTriangles(touchedCount);
+        return false;
+    }
+
+    private int collectTouchedTriangles(Selection selection) {
+        int count = 0;
         for (int s = 0; s < selection.count; s++) {
-            moveVertexSafely(selection.vertices[s], dx[s], dy[s], dz[s]);
+            int vertex = selection.vertices[s];
+            for (int triangle : incidentTriangles[vertex]) {
+                if (!touchedTriangleMask[triangle]) {
+                    touchedTriangleMask[triangle] = true;
+                    touchedTriangles[count++] = triangle;
+                }
+            }
+        }
+        return count;
+    }
+
+    private void clearTouchedTriangles(int count) {
+        for (int i = 0; i < count; i++) {
+            touchedTriangleMask[touchedTriangles[i]] = false;
         }
     }
 
-    private boolean moveVertexSafely(int vertex, float dx, float dy, float dz) {
-        if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) < 1e-10f) return true;
-
-        int base = vertex * 3;
-        float oldX = positions[base];
-        float oldY = positions[base + 1];
-        float oldZ = positions[base + 2];
-
-        float newX = oldX + dx;
-        float newY = oldY + dy;
-        float newZ = oldZ + dz;
-
-        for (int triangle : incidentTriangles[vertex]) {
-            int iaVertex = indices[triangle * 3];
-            int ibVertex = indices[triangle * 3 + 1];
-            int icVertex = indices[triangle * 3 + 2];
-
-            float[] oldNormal = faceNormal(iaVertex, ibVertex, icVertex, -1, 0f, 0f, 0f);
-            float oldLen = length(oldNormal[0], oldNormal[1], oldNormal[2]);
-            if (oldLen < 1e-8f) return false;
-
-            float[] newNormal = faceNormal(
-                    iaVertex, ibVertex, icVertex,
-                    vertex, newX, newY, newZ
-            );
-            float newLen = length(newNormal[0], newNormal[1], newNormal[2]);
-
-            if (newLen < oldLen * 0.12f || newLen < 1e-8f) return false;
-
-            float orientation = (
-                    oldNormal[0] * newNormal[0]
-                            + oldNormal[1] * newNormal[1]
-                            + oldNormal[2] * newNormal[2]
-            ) / (oldLen * newLen);
-
-            if (orientation < 0.18f) return false;
+    private boolean validateTouchedTriangles(float[] before, float[] candidate, int touchedCount) {
+        for (int i = 0; i < touchedCount; i++) {
+            if (!validateTriangle(before, candidate, touchedTriangles[i], true)) return false;
         }
-
-        positions[base] = newX;
-        positions[base + 1] = newY;
-        positions[base + 2] = newZ;
         return true;
     }
 
-    private float[] faceNormal(
-            int aVertex, int bVertex, int cVertex,
-            int overrideVertex,
-            float overrideX, float overrideY, float overrideZ
-    ) {
-        float ax, ay, az, bx, by, bz, cx, cy, cz;
+    private boolean validateTriangle(float[] before, float[] candidate, int triangle, boolean checkStep) {
+        int a = indices[triangle * 3];
+        int b = indices[triangle * 3 + 1];
+        int c = indices[triangle * 3 + 2];
 
-        if (aVertex == overrideVertex) {
-            ax = overrideX; ay = overrideY; az = overrideZ;
-        } else {
-            int a = aVertex * 3;
-            ax = positions[a]; ay = positions[a + 1]; az = positions[a + 2];
+        if (!finiteVertex(candidate, a) || !finiteVertex(candidate, b) || !finiteVertex(candidate, c)) {
+            return false;
         }
 
-        if (bVertex == overrideVertex) {
-            bx = overrideX; by = overrideY; bz = overrideZ;
-        } else {
-            int b = bVertex * 3;
-            bx = positions[b]; by = positions[b + 1]; bz = positions[b + 2];
+        triangleNormal(before, a, b, c, normalScratchOld);
+        triangleNormal(candidate, a, b, c, normalScratchNew);
+        float oldArea2 = length(normalScratchOld[0], normalScratchOld[1], normalScratchOld[2]);
+        float newArea2 = length(normalScratchNew[0], normalScratchNew[1], normalScratchNew[2]);
+        float restArea2 = restTriangleArea2[triangle];
+
+        if (!(newArea2 > 1e-8f)) return false;
+        if (newArea2 < restArea2 * MIN_REST_AREA_RATIO) return false;
+        if (checkStep && newArea2 < oldArea2 * MIN_STEP_AREA_RATIO) return false;
+
+        if (checkStep && oldArea2 > 1e-8f) {
+            float dot = (
+                    normalScratchOld[0] * normalScratchNew[0]
+                            + normalScratchOld[1] * normalScratchNew[1]
+                            + normalScratchOld[2] * normalScratchNew[2]
+            ) / (oldArea2 * newArea2);
+            if (!Float.isFinite(dot) || dot < MIN_STEP_NORMAL_DOT) return false;
         }
 
-        if (cVertex == overrideVertex) {
-            cx = overrideX; cy = overrideY; cz = overrideZ;
-        } else {
-            int c = cVertex * 3;
-            cx = positions[c]; cy = positions[c + 1]; cz = positions[c + 2];
+        float ab = edgeLength(candidate, a, b);
+        float bc = edgeLength(candidate, b, c);
+        float ca = edgeLength(candidate, c, a);
+        float restAb = edgeLength(originalPositions, a, b);
+        float restBc = edgeLength(originalPositions, b, c);
+        float restCa = edgeLength(originalPositions, c, a);
+
+        if (!edgeWithinRestBudget(ab, restAb)
+                || !edgeWithinRestBudget(bc, restBc)
+                || !edgeWithinRestBudget(ca, restCa)) {
+            return false;
         }
 
-        float abx = bx - ax;
-        float aby = by - ay;
-        float abz = bz - az;
-        float acx = cx - ax;
-        float acy = cy - ay;
-        float acz = cz - az;
+        if (checkStep) {
+            float oldAb = edgeLength(before, a, b);
+            float oldBc = edgeLength(before, b, c);
+            float oldCa = edgeLength(before, c, a);
+            if (!edgeWithinStepBudget(ab, oldAb)
+                    || !edgeWithinStepBudget(bc, oldBc)
+                    || !edgeWithinStepBudget(ca, oldCa)) {
+                return false;
+            }
+        }
 
-        return new float[]{
-                aby * acz - abz * acy,
-                abz * acx - abx * acz,
-                abx * acy - aby * acx
-        };
+        float quality = triangleQuality(newArea2, ab, bc, ca);
+        return Float.isFinite(quality) && quality >= MIN_TRIANGLE_QUALITY;
     }
 
-    private float minNeighborEdgeLength(int vertex) {
-        return minNeighborEdgeLengthFrom(positions, vertex);
+    private boolean edgeWithinRestBudget(float edge, float rest) {
+        if (!(edge > 1e-8f) || !(rest > 1e-8f)) return false;
+        return edge >= rest * MIN_EDGE_COMPRESSION && edge <= rest * MAX_EDGE_STRETCH;
+    }
+
+    private boolean edgeWithinStepBudget(float edge, float oldEdge) {
+        if (!(oldEdge > 1e-8f)) return false;
+        return edge >= oldEdge * MIN_STEP_EDGE_SHRINK && edge <= oldEdge * MAX_STEP_EDGE_GROWTH;
+    }
+
+    private static float triangleQuality(float area2, float ab, float bc, float ca) {
+        float denominator = ab * ab + bc * bc + ca * ca;
+        if (!(denominator > 1e-12f)) return 0f;
+        // 4*sqrt(3)*A/sum(l^2); area2 = 2A, so factor is 2*sqrt(3).
+        return (2f * 1.7320508f * area2) / denominator;
     }
 
     private float minNeighborEdgeLengthFrom(float[] source, int vertex) {
@@ -546,6 +682,54 @@ final class SculptMesh {
             if (len > 1e-8f && len < min) min = len;
         }
         return Float.isFinite(min) ? min : 0.01f;
+    }
+
+    private float triangleArea2(float[] source, int triangle) {
+        int a = indices[triangle * 3];
+        int b = indices[triangle * 3 + 1];
+        int c = indices[triangle * 3 + 2];
+        triangleNormal(source, a, b, c, normalScratchOld);
+        return length(normalScratchOld[0], normalScratchOld[1], normalScratchOld[2]);
+    }
+
+    private static void triangleNormal(
+            float[] source,
+            int aVertex,
+            int bVertex,
+            int cVertex,
+            float[] out
+    ) {
+        int a = aVertex * 3;
+        int b = bVertex * 3;
+        int c = cVertex * 3;
+
+        float abx = source[b] - source[a];
+        float aby = source[b + 1] - source[a + 1];
+        float abz = source[b + 2] - source[a + 2];
+        float acx = source[c] - source[a];
+        float acy = source[c + 1] - source[a + 1];
+        float acz = source[c + 2] - source[a + 2];
+
+        out[0] = aby * acz - abz * acy;
+        out[1] = abz * acx - abx * acz;
+        out[2] = abx * acy - aby * acx;
+    }
+
+    private static float edgeLength(float[] source, int aVertex, int bVertex) {
+        int a = aVertex * 3;
+        int b = bVertex * 3;
+        return length(
+                source[b] - source[a],
+                source[b + 1] - source[a + 1],
+                source[b + 2] - source[a + 2]
+        );
+    }
+
+    private static boolean finiteVertex(float[] source, int vertex) {
+        int base = vertex * 3;
+        return Float.isFinite(source[base])
+                && Float.isFinite(source[base + 1])
+                && Float.isFinite(source[base + 2]);
     }
 
     private static float intersectTriangle(
@@ -650,6 +834,7 @@ final class SculptMesh {
         float y = (va[1] + vb[1]) * 0.5f;
         float z = (va[2] + vb[2]) * 0.5f;
         float len = length(x, y, z);
+        if (len < 1e-8f) throw new IllegalStateException("Icosphere midpoint collapsed");
         x /= len;
         y /= len;
         z /= len;
@@ -662,6 +847,7 @@ final class SculptMesh {
 
     private static void addUnit(List<float[]> vertices, float x, float y, float z) {
         float len = length(x, y, z);
+        if (len < 1e-8f) throw new IllegalArgumentException("zero-length vertex");
         vertices.add(new float[]{x / len, y / len, z / len});
     }
 
@@ -686,6 +872,13 @@ final class SculptMesh {
         float mz = (positions[ia + 2] + positions[ib + 2] + positions[ic + 2]) / 3f;
 
         return nx * mx + ny * my + nz * mz > 0f;
+    }
+
+    private static boolean allFinite(float... values) {
+        for (float value : values) {
+            if (!Float.isFinite(value)) return false;
+        }
+        return true;
     }
 
     private static float length(float x, float y, float z) {

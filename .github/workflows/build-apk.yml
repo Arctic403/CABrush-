@@ -20,9 +20,18 @@ jobs:
           gradle-version: '8.7'
       - name: Install SDK 35
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Stress-test sculpt core
+        run: |
+          rm -rf build/core-self-test
+          mkdir -p build/core-self-test
+          javac -d build/core-self-test \
+            app/src/main/java/com/fallpoint/pocketsculpt/BrushMode.java \
+            app/src/main/java/com/fallpoint/pocketsculpt/SculptMesh.java \
+            tools/SculptCoreSelfTest.java
+          java -cp build/core-self-test com.fallpoint.pocketsculpt.SculptCoreSelfTest
       - name: Build debug APK
         run: gradle assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: PocketSculpt-v1.1-debug
+          name: PocketSculpt-v1.2-debug
           path: app/build/outputs/apk/debug/app-debug.apk

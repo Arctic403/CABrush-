@@ -71,7 +71,11 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         uModel = GLES30.glGetUniformLocation(program, "uModel");
         uLightDirection = GLES30.glGetUniformLocation(program, "uLightDirection");
 
-        mesh = SculptMesh.createIcoSphere(4, 1f);
+        if (mesh == null) {
+            mesh = SculptMesh.createIcoSphere(4, 1f);
+        }
+        // Android may recreate the GL context even when the Activity survives.
+        // Keep the CPU mesh/history and only recreate GPU-side buffers/program state.
         allocateBuffers();
         Matrix.setIdentityM(model, 0);
     }
@@ -191,35 +195,55 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
         SculptMesh.Hit hit = mesh.raycast(ray.origin, ray.direction);
         if (hit == null) return false;
 
-        mesh.applyBrush(
+        float effectiveStrength = brushStrength;
+        float mirroredSeparation = Math.abs(hit.x) * 2f;
+        if (symmetryX && mirroredSeparation < brushRadius * 2f) {
+            // When the two symmetry brushes overlap, reduce each contribution so
+            // the center seam does not receive an accidental double-strength hit.
+            float overlap = 1f - mirroredSeparation / Math.max(1e-6f, brushRadius * 2f);
+            effectiveStrength = brushStrength / (1f + overlap);
+        }
+
+        boolean changed = mesh.applyBrush(
                 hit.x, hit.y, hit.z,
                 hit.nx, hit.ny, hit.nz,
                 ray.direction,
                 brushRadius,
-                brushStrength,
+                effectiveStrength,
                 brushMode,
                 true
         );
 
         if (symmetryX) {
+            if (changed) {
+                // The mirrored selection relies on current normals. Refresh them
+                // after the primary transaction instead of using stale pre-dab data.
+                mesh.recalculateNormals();
+            }
+
             float[] mirroredView = new float[]{
                     -ray.direction[0],
                     ray.direction[1],
                     ray.direction[2]
             };
-            mesh.applyBrush(
+            boolean mirroredChanged = mesh.applyBrush(
                     -hit.x, hit.y, hit.z,
                     -hit.nx, hit.ny, hit.nz,
                     mirroredView,
                     brushRadius,
-                    brushStrength,
+                    effectiveStrength,
                     brushMode,
                     false
             );
+            changed |= mirroredChanged;
         }
 
-        mesh.recalculateNormals();
-        buffersDirty = true;
+        if (changed) {
+            mesh.recalculateNormals();
+            buffersDirty = true;
+        }
+        // A valid ray hit still counts as a consumed dab even if the geometry
+        // guard rejected movement because the fixed topology reached its limit.
         return true;
     }
 
@@ -243,7 +267,9 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
 
     public void undo() {
         if (mesh == null || undoStack.isEmpty()) return;
+        hasLastDab = false;
         redoStack.push(mesh.copyPositions());
+        trimHistory(redoStack);
         mesh.setPositions(undoStack.pop());
         mesh.recalculateNormals();
         buffersDirty = true;
@@ -251,7 +277,9 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
 
     public void redo() {
         if (mesh == null || redoStack.isEmpty()) return;
+        hasLastDab = false;
         undoStack.push(mesh.copyPositions());
+        trimHistory(undoStack);
         mesh.setPositions(redoStack.pop());
         mesh.recalculateNormals();
         buffersDirty = true;
@@ -259,10 +287,14 @@ public final class SculptRenderer implements GLSurfaceView.Renderer {
 
     public void resetMesh() {
         if (mesh == null) return;
-        undoStack.push(mesh.copyPositions());
+        float[] before = mesh.copyPositions();
+        mesh.reset();
+        if (samePositions(before, mesh.positions)) return;
+
+        hasLastDab = false;
+        undoStack.push(before);
         trimHistory(undoStack);
         redoStack.clear();
-        mesh.reset();
         mesh.recalculateNormals();
         buffersDirty = true;
     }
