@@ -49,4 +49,5 @@ jobs:
             exit 0
           fi
           git commit -m "build: add Gradle 8.7 wrapper"
+          git pull --rebase origin main
           git push origin HEAD:main
