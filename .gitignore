@@ -1,6 +1,33 @@
+# Gradle / Android build state
 .gradle/
-.idea/
-local.properties
 **/build/
+.cxx/
+.externalNativeBuild/
+captures/
+
+# IDE / local machine state
+.idea/
+.vscode/
 *.iml
+local.properties
 .DS_Store
+Thumbs.db
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+keystore.properties
+signing.properties
+secrets.properties
+*.jks
+*.keystore
+
+# Generated Android packages
+*.apk
+*.aab
+
+# Temporary files
+*.tmp
+*.swp
+*~
