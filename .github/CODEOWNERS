@@ -1,0 +1,8 @@
+# PocketSculpt / CABrush repository ownership
+* @Arctic403
+
+# Keep build and CI changes explicitly owned.
+/.github/ @Arctic403
+/gradle/ @Arctic403
+/gradlew @Arctic403
+/gradlew.bat @Arctic403
