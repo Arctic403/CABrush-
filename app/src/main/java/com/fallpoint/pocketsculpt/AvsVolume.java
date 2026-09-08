@@ -38,10 +38,16 @@ final class AvsVolume {
         float nx, ny, nz;
         float t;
         boolean hit;
+        int marchSteps;
+        int refineSteps;
+        long durationNanos;
 
         RayHit clear() {
             hit = false;
             x = y = z = nx = ny = nz = t = 0f;
+            marchSteps = 0;
+            refineSteps = 0;
+            durationNanos = 0L;
             return this;
         }
     }
@@ -53,6 +59,11 @@ final class AvsVolume {
         int allocatedBricks;
         float centerX, centerY, centerZ;
         float effectiveDepth;
+        int testedSamples;
+        int candidateSamples;
+        long durationNanos;
+        long fieldVersionBefore;
+        long fieldVersionAfter;
     }
 
     static final class Stats {
@@ -90,6 +101,7 @@ final class AvsVolume {
     private AvsVolume() {}
 
     static AvsVolume createSphere(float radius) {
+        long diagStart = EngineDiagnostics.nowNanos();
         if (!(radius > 0f) || !Float.isFinite(radius)) {
             throw new IllegalArgumentException("radius");
         }
@@ -127,6 +139,14 @@ final class AvsVolume {
         }
         v.fieldVersion++;
         v.markAllDirty();
+        if (EngineDiagnostics.isEnabled()) {
+            EngineDiagnostics.state("avs.voxel_size", String.valueOf(VOXEL_SIZE));
+            EngineDiagnostics.state("avs.brick_size", String.valueOf(BRICK_SIZE));
+            EngineDiagnostics.state("avs.max_bricks", String.valueOf(MAX_BRICKS));
+            EngineDiagnostics.timed("avs", "create_sphere", diagStart,
+                    "radius=" + radius + " bricks=" + v.brickCount
+                            + " field_version=" + v.fieldVersion);
+        }
         return v;
     }
 
@@ -229,10 +249,14 @@ final class AvsVolume {
     }
 
     RayHit raycast(float ox, float oy, float oz, float dx, float dy, float dz, RayHit out) {
+        long diagStart = EngineDiagnostics.nowNanos();
         if (out == null) out = new RayHit();
         out.clear();
         float dlen = (float)Math.sqrt(dx*dx + dy*dy + dz*dz);
-        if (dlen < 1e-8f || brickCount == 0) return out;
+        if (dlen < 1e-8f || brickCount == 0) {
+            finishRayTelemetry(out, diagStart, "invalid-or-empty", ox, oy, oz, dx, dy, dz);
+            return out;
+        }
         dx /= dlen; dy /= dlen; dz /= dlen;
 
         float minX = minBx * BRICK_SIZE * VOXEL_SIZE - VOXEL_SIZE;
@@ -243,21 +267,29 @@ final class AvsVolume {
         float maxZ = (maxBz + 1) * BRICK_SIZE * VOXEL_SIZE + VOXEL_SIZE;
 
         float[] interval = rayBox(ox, oy, oz, dx, dy, dz, minX, minY, minZ, maxX, maxY, maxZ);
-        if (interval == null) return out;
+        if (interval == null) {
+            finishRayTelemetry(out, diagStart, "box-miss", ox, oy, oz, dx, dy, dz);
+            return out;
+        }
         float t0 = Math.max(0f, interval[0]);
         float t1 = interval[1];
-        if (!(t1 > t0)) return out;
+        if (!(t1 > t0)) {
+            finishRayTelemetry(out, diagStart, "empty-interval", ox, oy, oz, dx, dy, dz);
+            return out;
+        }
 
         float step = VOXEL_SIZE * 0.45f;
         float prevT = t0;
         float prev = sample(ox + dx*prevT, oy + dy*prevT, oz + dz*prevT);
 
         for (float t = t0 + step; t <= t1 + step * 0.5f; t += step) {
+            out.marchSteps++;
             float tt = Math.min(t, t1);
             float cur = sample(ox + dx*tt, oy + dy*tt, oz + dz*tt);
             if (prev > 0f && cur <= 0f) {
                 float lo = prevT, hi = tt;
                 for (int i = 0; i < 10; i++) {
+                    out.refineSteps++;
                     float mid = (lo + hi) * 0.5f;
                     float mv = sample(ox + dx*mid, oy + dy*mid, oz + dz*mid);
                     if (mv > 0f) lo = mid; else hi = mid;
@@ -271,22 +303,63 @@ final class AvsVolume {
                 gradient(out.x, out.y, out.z, g);
                 out.nx = g[0]; out.ny = g[1]; out.nz = g[2];
                 out.hit = true;
+                finishRayTelemetry(out, diagStart, "hit", ox, oy, oz, dx, dy, dz);
                 return out;
             }
             prev = cur;
             prevT = tt;
             if (tt >= t1) break;
         }
+        finishRayTelemetry(out, diagStart, "field-miss", ox, oy, oz, dx, dy, dz);
         return out;
+    }
+
+    private void finishRayTelemetry(RayHit out, long startNanos, String result,
+                                    float ox, float oy, float oz,
+                                    float dx, float dy, float dz) {
+        if (!EngineDiagnostics.isEnabled()) return;
+        out.durationNanos = startNanos == 0L ? 0L : System.nanoTime() - startNanos;
+        EngineDiagnostics.counter("avs.raycast.calls", 1L);
+        EngineDiagnostics.counter("avs.raycast.march_steps", out.marchSteps);
+        EngineDiagnostics.counter("avs.raycast.refine_steps", out.refineSteps);
+        EngineDiagnostics.gauge("avs.raycast.last_ms", out.durationNanos / 1_000_000.0);
+        EngineDiagnostics.record("raycast", result,
+                "origin=" + ox + "," + oy + "," + oz
+                        + " dir=" + dx + "," + dy + "," + dz
+                        + " hit=" + out.hit
+                        + " t=" + out.t
+                        + " p=" + out.x + "," + out.y + "," + out.z
+                        + " n=" + out.nx + "," + out.ny + "," + out.nz
+                        + " march=" + out.marchSteps
+                        + " refine=" + out.refineSteps
+                        + " duration_ns=" + out.durationNanos);
+        if (out.durationNanos > 50_000_000L) {
+            EngineDiagnostics.anomaly("slow_raycast",
+                    "duration_ns=" + out.durationNanos + " march=" + out.marchSteps
+                            + " bricks=" + brickCount);
+        }
     }
 
     BrushResult applyClay(float hitX, float hitY, float hitZ,
                            float nx, float ny, float nz,
                            float radius, float strength, BrushMode mode) {
+        long diagStart = EngineDiagnostics.nowNanos();
+        long beforeVersion = fieldVersion;
         BrushResult result = new BrushResult();
-        if (mode == null || !(radius > VOXEL_SIZE * 0.5f) || !(strength > 0f)) return result;
+        result.fieldVersionBefore = beforeVersion;
+        result.fieldVersionAfter = beforeVersion;
+
+        if (mode == null || !(radius > VOXEL_SIZE * 0.5f) || !(strength > 0f)) {
+            finishBrushTelemetry("clay-rejected", result, diagStart,
+                    hitX, hitY, hitZ, radius, strength, mode);
+            return result;
+        }
         float nlen = (float)Math.sqrt(nx*nx + ny*ny + nz*nz);
-        if (nlen < 1e-8f) return result;
+        if (nlen < 1e-8f) {
+            finishBrushTelemetry("clay-bad-normal", result, diagStart,
+                    hitX, hitY, hitZ, radius, strength, mode);
+            return result;
+        }
         nx /= nlen; ny /= nlen; nz /= nlen;
 
         float depth = Math.max(VOXEL_SIZE * 0.45f, strength * 2.10f);
@@ -307,14 +380,73 @@ final class AvsVolume {
         );
         csg.centerX = cx; csg.centerY = cy; csg.centerZ = cz;
         csg.effectiveDepth = depth;
+        csg.fieldVersionBefore = beforeVersion;
+        csg.fieldVersionAfter = fieldVersion;
+        finishBrushTelemetry("clay", csg, diagStart,
+                hitX, hitY, hitZ, radius, strength, mode);
         return csg;
+    }
+
+    private void finishBrushTelemetry(String name, BrushResult r, long startNanos,
+                                      float hitX, float hitY, float hitZ,
+                                      float radius, float strength, BrushMode mode) {
+        if (!EngineDiagnostics.isEnabled()) return;
+        r.durationNanos = startNanos == 0L ? 0L : System.nanoTime() - startNanos;
+        EngineDiagnostics.counter("avs.brush.calls", 1L);
+        if (r.changed) EngineDiagnostics.counter("avs.brush.changed", 1L);
+        EngineDiagnostics.counter("avs.brush.changed_samples", r.changedSamples);
+        EngineDiagnostics.counter("avs.brush.touched_bricks", r.touchedBricks);
+        EngineDiagnostics.counter("avs.brush.allocated_bricks", r.allocatedBricks);
+        EngineDiagnostics.gauge("avs.brush.last_ms", r.durationNanos / 1_000_000.0);
+        EngineDiagnostics.gauge("avs.brush.last_changed_samples", r.changedSamples);
+        EngineDiagnostics.gauge("avs.brush.last_depth", r.effectiveDepth);
+        boolean depthFloorDominant = strength * 2.10f < VOXEL_SIZE * 0.45f;
+        EngineDiagnostics.state("brush.depth_floor_world", String.valueOf(VOXEL_SIZE * 0.45f));
+        EngineDiagnostics.state("brush.depth_floor_dominant", String.valueOf(depthFloorDominant));
+        EngineDiagnostics.state("avs.field_version", String.valueOf(fieldVersion));
+        EngineDiagnostics.state("avs.brick_count", String.valueOf(brickCount));
+        EngineDiagnostics.record("brush", name,
+                "mode=" + String.valueOf(mode)
+                        + " hit=" + hitX + "," + hitY + "," + hitZ
+                        + " radius=" + radius
+                        + " strength=" + strength
+                        + " center=" + r.centerX + "," + r.centerY + "," + r.centerZ
+                        + " depth=" + r.effectiveDepth
+                        + " depth_floor_dominant=" + depthFloorDominant
+                        + " changed=" + r.changed
+                        + " changed_samples=" + r.changedSamples
+                        + " tested_samples=" + r.testedSamples
+                        + " candidate_samples=" + r.candidateSamples
+                        + " touched_bricks=" + r.touchedBricks
+                        + " allocated_bricks=" + r.allocatedBricks
+                        + " field=" + r.fieldVersionBefore + "->" + r.fieldVersionAfter
+                        + " duration_ns=" + r.durationNanos);
+
+        if (r.durationNanos > 100_000_000L) {
+            EngineDiagnostics.anomaly("slow_brush",
+                    "duration_ns=" + r.durationNanos
+                            + " tested=" + r.testedSamples
+                            + " changed=" + r.changedSamples);
+        }
+        if (r.allocatedBricks > 256 || brickCount > (int)(MAX_BRICKS * 0.80f)) {
+            EngineDiagnostics.anomaly("brick_growth",
+                    "allocated_this_dab=" + r.allocatedBricks
+                            + " total=" + brickCount + "/" + MAX_BRICKS);
+        }
+        if (r.changedSamples > 30_000) {
+            EngineDiagnostics.anomaly("brush_sample_spike",
+                    "changed_samples=" + r.changedSamples
+                            + " radius=" + radius + " strength=" + strength);
+        }
     }
 
     private BrushResult applyEllipsoidCsg(float cx, float cy, float cz,
                                            float nx, float ny, float nz,
                                            float tangentRadius, float normalRadius,
                                            boolean add) {
+        long diagStart = EngineDiagnostics.nowNanos();
         BrushResult result = new BrushResult();
+        result.fieldVersionBefore = fieldVersion;
         float reach = tangentRadius + BAND_WORLD;
         changedBrickCount = 0;
         int stamp = nextStamp();
@@ -335,6 +467,7 @@ final class AvsVolume {
             for (int gy=minGy; gy<=maxGy; gy++) {
                 float y=gy*VOXEL_SIZE;
                 for (int gx=minGx; gx<=maxGx; gx++) {
+                    result.testedSamples++;
                     float x=gx*VOXEL_SIZE;
                     float dx=x-cx,dy=y-cy,dz=z-cz;
                     float axial=dx*nx+dy*ny+dz*nz;
@@ -343,6 +476,7 @@ final class AvsVolume {
                     float q=(float)Math.sqrt(tangent2*invT*invT + axial*axial*invN*invN)-1f;
                     float brush=q*distanceScale;
                     if (brush > BAND_WORLD) continue;
+                    result.candidateSamples++;
                     changedSamples += applySampleCsg(gx,gy,gz,brush,add,stamp);
                 }
             }
@@ -355,11 +489,31 @@ final class AvsVolume {
         result.changedSamples=changedSamples;
         result.touchedBricks=changedBrickCount;
         result.allocatedBricks=brickCount-beforeBricks;
+        result.fieldVersionAfter=fieldVersion;
+        if (EngineDiagnostics.isEnabled()) {
+            result.durationNanos = diagStart == 0L ? 0L : System.nanoTime() - diagStart;
+            EngineDiagnostics.counter("avs.csg.ellipsoid.calls", 1L);
+            EngineDiagnostics.counter("avs.csg.ellipsoid.tested_samples", result.testedSamples);
+            EngineDiagnostics.counter("avs.csg.ellipsoid.candidate_samples", result.candidateSamples);
+            EngineDiagnostics.gauge("avs.csg.ellipsoid.last_ms", result.durationNanos / 1_000_000.0);
+            EngineDiagnostics.record("csg", add ? "ellipsoid-union" : "ellipsoid-subtract",
+                    "center=" + cx + "," + cy + "," + cz
+                            + " tangent_radius=" + tangentRadius
+                            + " normal_radius=" + normalRadius
+                            + " tested=" + result.testedSamples
+                            + " candidates=" + result.candidateSamples
+                            + " changed=" + result.changedSamples
+                            + " touched_bricks=" + result.touchedBricks
+                            + " allocated_bricks=" + result.allocatedBricks
+                            + " duration_ns=" + result.durationNanos);
+        }
         return result;
     }
 
     BrushResult applySphereCsg(float cx, float cy, float cz, float radius, boolean add) {
+        long diagStart = EngineDiagnostics.nowNanos();
         BrushResult result = new BrushResult();
+        result.fieldVersionBefore = fieldVersion;
         if (!(radius > 0f) || !Float.isFinite(radius)) return result;
 
         changedBrickCount = 0;
@@ -379,11 +533,12 @@ final class AvsVolume {
             for (int gy = minGy; gy <= maxGy; gy++) {
                 float y = gy * VOXEL_SIZE;
                 for (int gx = minGx; gx <= maxGx; gx++) {
+                    result.testedSamples++;
                     float x = gx * VOXEL_SIZE;
                     float dx = x - cx, dy = y - cy, dz = z - cz;
                     float brush = (float)Math.sqrt(dx*dx + dy*dy + dz*dz) - radius;
                     if (Math.abs(brush) > BAND_WORLD && brush > 0f) continue;
-
+                    result.candidateSamples++;
                     changedSamples += applySampleCsg(gx,gy,gz,brush,add,stamp);
                 }
             }
@@ -397,6 +552,23 @@ final class AvsVolume {
         result.changedSamples = changedSamples;
         result.touchedBricks = changedBrickCount;
         result.allocatedBricks = brickCount - beforeBricks;
+        result.fieldVersionAfter = fieldVersion;
+        if (EngineDiagnostics.isEnabled()) {
+            result.durationNanos = diagStart == 0L ? 0L : System.nanoTime() - diagStart;
+            EngineDiagnostics.counter("avs.csg.sphere.calls", 1L);
+            EngineDiagnostics.counter("avs.csg.sphere.tested_samples", result.testedSamples);
+            EngineDiagnostics.counter("avs.csg.sphere.candidate_samples", result.candidateSamples);
+            EngineDiagnostics.gauge("avs.csg.sphere.last_ms", result.durationNanos / 1_000_000.0);
+            EngineDiagnostics.record("csg", add ? "sphere-union" : "sphere-subtract",
+                    "center=" + cx + "," + cy + "," + cz
+                            + " radius=" + radius
+                            + " tested=" + result.testedSamples
+                            + " candidates=" + result.candidateSamples
+                            + " changed=" + result.changedSamples
+                            + " touched_bricks=" + result.touchedBricks
+                            + " allocated_bricks=" + result.allocatedBricks
+                            + " duration_ns=" + result.durationNanos);
+        }
         return result;
     }
 
@@ -470,6 +642,7 @@ final class AvsVolume {
     }
 
     void restore(AvsSnapshot snapshot) {
+        long diagStart = EngineDiagnostics.nowNanos();
         if (snapshot == null) throw new IllegalArgumentException("snapshot");
         brickLookup.clear();
         brickCount = 0;
@@ -487,6 +660,12 @@ final class AvsVolume {
         fieldVersion++;
         allocationVersion++;
         markAllDirty();
+        if (EngineDiagnostics.isEnabled()) {
+            EngineDiagnostics.timed("avs", "restore_snapshot", diagStart,
+                    "bricks=" + brickCount + " field_version=" + fieldVersion);
+            EngineDiagnostics.state("avs.brick_count", String.valueOf(brickCount));
+            EngineDiagnostics.state("avs.field_version", String.valueOf(fieldVersion));
+        }
     }
 
     private Brick ensureBrick(int bx, int by, int bz) {
@@ -503,6 +682,14 @@ final class AvsVolume {
         minBx = Math.min(minBx, bx); minBy = Math.min(minBy, by); minBz = Math.min(minBz, bz);
         maxBx = Math.max(maxBx, bx); maxBy = Math.max(maxBy, by); maxBz = Math.max(maxBz, bz);
         allocationVersion++;
+        if (EngineDiagnostics.isEnabled()) {
+            EngineDiagnostics.counter("avs.bricks_allocated", 1L);
+            EngineDiagnostics.gauge("avs.brick_count", brickCount);
+            if (brickCount == MAX_BRICKS) {
+                EngineDiagnostics.anomaly("brick_budget_exhausted",
+                        "brick_count=" + brickCount + " max=" + MAX_BRICKS);
+            }
+        }
         return b;
     }
 

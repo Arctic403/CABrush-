@@ -116,6 +116,28 @@ The dump records field hashes, surface hashes, boundary/non-manifold/directed-ed
 
 Clay+ and Clay- modify the field with CSG. They never move triangle vertices.
 
+
+## Deep runtime diagnostics
+
+PocketSculpt now has an engine-level diagnostic flight recorder for Android development. The master
+switch is intentionally one line in root `gradle.properties`:
+
+    cabrush.devMode=on
+
+Flip it to:
+
+    cabrush.devMode=off
+
+for final/production builds. When off, the runtime dump writer, crash hook, automatic anomaly dumps,
+DEV Dump button and event recording stay disabled. The build-time Surface Truth VSS still runs.
+
+With dev mode on, the recorder follows input -> GL queue -> screen ray -> AVS hit -> Clay CSG ->
+dirty bricks -> surface extraction -> GPU upload -> frame timing. It also records device/memory/
+thermal state and can automatically dump on Clay self-extrusion, frame/queue/raycast/rebuild stalls,
+GL errors, runaway brick/triangle growth and uncaught exceptions.
+
+See `docs/ENGINE_DIAGNOSTICS.md` for the dump schema and complete coverage.
+
 ## Build
 
 Requirements:

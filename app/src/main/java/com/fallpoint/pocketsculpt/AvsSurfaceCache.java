@@ -66,6 +66,8 @@ final class AvsSurfaceCache {
         long surfaceVersion;
         int rebuiltChunks;
         long rebuiltBytes;
+        long rebuildNanos;
+        int dirtyBefore;
         int totalTriangles;
         int totalVertices;
 
@@ -114,13 +116,29 @@ final class AvsSurfaceCache {
     }
 
     private void rebuildDirty() {
+        long diagStart = EngineDiagnostics.nowNanos();
         ensureChunkCapacity(volume.brickCount());
         int rebuilt = 0;
         long bytes = 0;
+        int dirtyBefore = volume.dirtyBrickCount();
 
         for (int id = 0; id < volume.brickCount(); id++) {
             if (!volume.isBrickDirty(id)) continue;
+            long chunkStart = EngineDiagnostics.nowNanos();
             Chunk c = buildChunk(id);
+            if (EngineDiagnostics.isEnabled()) {
+                long chunkNs = chunkStart == 0L ? 0L : System.nanoTime() - chunkStart;
+                EngineDiagnostics.counter("surface.chunks_rebuilt", 1L);
+                EngineDiagnostics.gauge("surface.last_chunk_ms", chunkNs / 1_000_000.0);
+                EngineDiagnostics.record("surface", "chunk_rebuild",
+                        "brick_id=" + id
+                                + " coord=" + volume.brick(id).bx + ","
+                                + volume.brick(id).by + "," + volume.brick(id).bz
+                                + " vertices=" + (c == null ? 0 : c.positions.length / 3)
+                                + " triangles=" + (c == null ? 0 : c.indices.length / 3)
+                                + " bytes=" + (c == null ? 0 : c.estimatedBytes())
+                                + " duration_ns=" + chunkNs);
+            }
             chunkByBrick[id] = c;
             volume.clearBrickDirty(id);
             rebuilt++;
@@ -143,8 +161,41 @@ final class AvsSurfaceCache {
         plan.surfaceVersion++;
         plan.rebuiltChunks = rebuilt;
         plan.rebuiltBytes = bytes;
+        plan.rebuildNanos = diagStart == 0L ? 0L : System.nanoTime() - diagStart;
+        plan.dirtyBefore = dirtyBefore;
         plan.totalTriangles = triangles;
         plan.totalVertices = vertices;
+
+        if (EngineDiagnostics.isEnabled()) {
+            EngineDiagnostics.counter("surface.rebuild_passes", 1L);
+            EngineDiagnostics.counter("surface.rebuilt_bytes", bytes);
+            EngineDiagnostics.gauge("surface.rebuild.last_ms", plan.rebuildNanos / 1_000_000.0);
+            EngineDiagnostics.gauge("surface.total_triangles", triangles);
+            EngineDiagnostics.gauge("surface.total_vertices", vertices);
+            EngineDiagnostics.gauge("surface.estimated_mb", plan.estimatedBytes() / 1048576.0);
+            EngineDiagnostics.state("surface.field_version", String.valueOf(plan.fieldVersion));
+            EngineDiagnostics.state("surface.surface_version", String.valueOf(plan.surfaceVersion));
+            EngineDiagnostics.record("surface", "rebuild_pass",
+                    "dirty_before=" + dirtyBefore
+                            + " rebuilt=" + rebuilt
+                            + " rebuilt_bytes=" + bytes
+                            + " chunks=" + plan.chunks.length
+                            + " vertices=" + vertices
+                            + " triangles=" + triangles
+                            + " estimated_bytes=" + plan.estimatedBytes()
+                            + " duration_ns=" + plan.rebuildNanos);
+            if (plan.rebuildNanos > 200_000_000L) {
+                EngineDiagnostics.anomaly("slow_surface_rebuild",
+                        "duration_ns=" + plan.rebuildNanos
+                                + " rebuilt=" + rebuilt
+                                + " triangles=" + triangles);
+            }
+            if (triangles > 1_000_000) {
+                EngineDiagnostics.anomaly("triangle_growth",
+                        "triangles=" + triangles + " vertices=" + vertices
+                                + " chunks=" + plan.chunks.length);
+            }
+        }
     }
 
     private Chunk buildChunk(int brickId) {

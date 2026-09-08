@@ -2,6 +2,14 @@ plugins {
     id 'com.android.application'
 }
 
+// One switch owns the entire runtime diagnostic system.
+// Use exactly "on" while developing and flip to "off" for production builds.
+def cabrushDevModeRaw = providers.gradleProperty('cabrush.devMode').orElse('on').get().toString().toLowerCase()
+if (!(cabrushDevModeRaw in ['on', 'off'])) {
+    throw new GradleException("cabrush.devMode must be 'on' or 'off', got: " + cabrushDevModeRaw)
+}
+def cabrushDevMode = cabrushDevModeRaw == 'on'
+
 android {
     namespace 'com.fallpoint.pocketsculpt'
     compileSdk 35
@@ -12,6 +20,11 @@ android {
         targetSdk 35
         versionCode 10
         versionName '0.4.1'
+        buildConfigField 'boolean', 'ENGINE_DIAGNOSTICS', cabrushDevMode ? 'true' : 'false'
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     buildTypes {
@@ -37,6 +50,7 @@ def vssReportDir = layout.buildDirectory.dir('vss/report')
 tasks.register('vssCompile', JavaCompile) {
     source = files(
             'src/main/java/com/fallpoint/pocketsculpt/BrushMode.java',
+            'src/main/java/com/fallpoint/pocketsculpt/EngineDiagnostics.java',
             'src/main/java/com/fallpoint/pocketsculpt/PrimitiveLongIntMap.java',
             'src/main/java/com/fallpoint/pocketsculpt/AvsVolume.java',
             'src/main/java/com/fallpoint/pocketsculpt/AvsSnapshot.java',

@@ -13,6 +13,7 @@ public final class SculptSurfaceView extends GLSurfaceView {
     private boolean navigating = false;
     private float lastNavX;
     private float lastNavY;
+    private long inputSequence;
 
     public SculptSurfaceView(Context context) {
         super(context);
@@ -27,26 +28,37 @@ public final class SculptSurfaceView extends GLSurfaceView {
             @Override
             public boolean onScale(ScaleGestureDetector detector) {
                 final float factor = detector.getScaleFactor();
-                queueEvent(() -> renderer.zoom(factor));
+                if (EngineDiagnostics.isEnabled()) {
+                    EngineDiagnostics.record("input", "pinch",
+                            "factor=" + factor
+                                    + " focus=" + detector.getFocusX() + "," + detector.getFocusY()
+                                    + " span=" + detector.getCurrentSpan());
+                }
+                queueTracked("zoom", () -> renderer.zoom(factor));
                 return true;
             }
         });
+
+        if (EngineDiagnostics.isEnabled()) {
+            EngineDiagnostics.record("input", "surface_view_created",
+                    "render_mode=continuous preserve_egl=true");
+        }
     }
 
     public void setBrushMode(BrushMode mode) {
-        queueEvent(() -> renderer.setBrushMode(mode));
+        queueTracked("set_brush_mode", () -> renderer.setBrushMode(mode));
     }
 
     public void setBrushRadius(float radius) {
-        queueEvent(() -> renderer.setBrushRadius(radius));
+        queueTracked("set_brush_radius", () -> renderer.setBrushRadius(radius));
     }
 
     public void setBrushStrength(float strength) {
-        queueEvent(() -> renderer.setBrushStrength(strength));
+        queueTracked("set_brush_strength", () -> renderer.setBrushStrength(strength));
     }
 
     public void resetMesh() {
-        queueEvent(renderer::resetMesh);
+        queueTracked("reset_mesh", renderer::resetMesh);
     }
 
     @Override
@@ -54,12 +66,38 @@ public final class SculptSurfaceView extends GLSurfaceView {
         scaleDetector.onTouchEvent(event);
         final int action = event.getActionMasked();
 
+        if (EngineDiagnostics.isEnabled()) {
+            inputSequence++;
+            StringBuilder detail = new StringBuilder(192);
+            detail.append("seq=").append(inputSequence)
+                    .append(" action=").append(actionName(action))
+                    .append(" action_index=").append(event.getActionIndex())
+                    .append(" pointers=").append(event.getPointerCount())
+                    .append(" history=").append(event.getHistorySize())
+                    .append(" event_time_ms=").append(event.getEventTime())
+                    .append(" down_time_ms=").append(event.getDownTime())
+                    .append(" sculpting=").append(sculpting)
+                    .append(" navigating=").append(navigating);
+            for (int i = 0; i < event.getPointerCount(); i++) {
+                detail.append(" p").append(i)
+                        .append("{id=").append(event.getPointerId(i))
+                        .append(",x=").append(event.getX(i))
+                        .append(",y=").append(event.getY(i))
+                        .append(",pressure=").append(event.getPressure(i))
+                        .append(",size=").append(event.getSize(i))
+                        .append("}");
+            }
+            EngineDiagnostics.record("input", "motion", detail.toString());
+            EngineDiagnostics.counter("input.motion_events", 1L);
+            EngineDiagnostics.counter("input.historical_points", event.getHistorySize());
+        }
+
         if (action == MotionEvent.ACTION_DOWN) {
             sculpting = true;
             navigating = false;
             final float x = event.getX();
             final float y = event.getY();
-            queueEvent(() -> {
+            queueTracked("stroke_begin", () -> {
                 renderer.beginStroke();
                 renderer.sculptAt(x, y);
             });
@@ -69,7 +107,7 @@ public final class SculptSurfaceView extends GLSurfaceView {
         if (action == MotionEvent.ACTION_POINTER_DOWN || event.getPointerCount() >= 2) {
             if (sculpting) {
                 sculpting = false;
-                queueEvent(renderer::endStroke);
+                queueTracked("stroke_end_multitouch", renderer::endStroke);
             }
             navigating = true;
             lastNavX = centroidX(event);
@@ -85,7 +123,7 @@ public final class SculptSurfaceView extends GLSurfaceView {
                 final float dy = cy - lastNavY;
                 lastNavX = cx;
                 lastNavY = cy;
-                queueEvent(() -> renderer.orbit(dx, dy));
+                queueTracked("orbit", () -> renderer.orbit(dx, dy));
                 return true;
             }
 
@@ -94,11 +132,11 @@ public final class SculptSurfaceView extends GLSurfaceView {
                 for (int h = 0; h < history; h++) {
                     final float hx = event.getHistoricalX(0, h);
                     final float hy = event.getHistoricalY(0, h);
-                    queueEvent(() -> renderer.sculptAt(hx, hy));
+                    queueTracked("sculpt_historical", () -> renderer.sculptAt(hx, hy));
                 }
                 final float x = event.getX();
                 final float y = event.getY();
-                queueEvent(() -> renderer.sculptAt(x, y));
+                queueTracked("sculpt_current", () -> renderer.sculptAt(x, y));
                 return true;
             }
         }
@@ -106,11 +144,12 @@ public final class SculptSurfaceView extends GLSurfaceView {
         if (action == MotionEvent.ACTION_POINTER_UP) {
             navigating = event.getPointerCount() - 1 >= 2;
             sculpting = false;
+            queueTracked("stroke_end_pointer_up", renderer::endStroke);
             return true;
         }
 
         if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-            if (sculpting) queueEvent(renderer::endStroke);
+            if (sculpting) queueTracked("stroke_end", renderer::endStroke);
             sculpting = false;
             navigating = false;
             return true;
@@ -121,10 +160,54 @@ public final class SculptSurfaceView extends GLSurfaceView {
 
     @Override
     public void onPause() {
-        queueEvent(renderer::endStroke);
+        queueTracked("stroke_end_pause", renderer::endStroke);
         sculpting = false;
         navigating = false;
+        if (EngineDiagnostics.isEnabled()) {
+            EngineDiagnostics.record("input", "surface_pause", "");
+        }
         super.onPause();
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        if (EngineDiagnostics.isEnabled()) {
+            EngineDiagnostics.record("input", "surface_resume", "");
+        }
+    }
+
+    private void queueTracked(String label, Runnable action) {
+        if (!EngineDiagnostics.isEnabled()) {
+            queueEvent(action);
+            return;
+        }
+        final long queued = System.nanoTime();
+        EngineDiagnostics.counter("gl_queue.enqueued", 1L);
+        queueEvent(() -> {
+            long waitNs = System.nanoTime() - queued;
+            EngineDiagnostics.counter("gl_queue.executed", 1L);
+            EngineDiagnostics.gauge("gl_queue.last_wait_ms", waitNs / 1_000_000.0);
+            EngineDiagnostics.record("gl_queue", "execute",
+                    "label=" + label + " wait_ns=" + waitNs);
+            if (waitNs > 150_000_000L) {
+                EngineDiagnostics.anomaly("gl_queue_stall",
+                        "label=" + label + " wait_ns=" + waitNs);
+            }
+            action.run();
+        });
+    }
+
+    private static String actionName(int action) {
+        switch (action) {
+            case MotionEvent.ACTION_DOWN: return "DOWN";
+            case MotionEvent.ACTION_UP: return "UP";
+            case MotionEvent.ACTION_MOVE: return "MOVE";
+            case MotionEvent.ACTION_CANCEL: return "CANCEL";
+            case MotionEvent.ACTION_POINTER_DOWN: return "POINTER_DOWN";
+            case MotionEvent.ACTION_POINTER_UP: return "POINTER_UP";
+            default: return String.valueOf(action);
+        }
     }
 
     private static float centroidX(MotionEvent event) {

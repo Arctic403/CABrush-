@@ -11,17 +11,22 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import android.widget.Toast;
 
 public class MainActivity extends Activity {
     private SculptSurfaceView sculptView;
     private Button addButton;
     private Button subtractButton;
+    private AndroidDiagnostics diagnostics;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().setStatusBarColor(Color.rgb(13, 15, 18));
         getWindow().setNavigationBarColor(Color.rgb(13, 15, 18));
+
+        diagnostics = AndroidDiagnostics.install(this);
+        if (diagnostics != null) diagnostics.onLifecycle("onCreate");
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.rgb(19, 22, 26));
@@ -47,12 +52,25 @@ public class MainActivity extends Activity {
         bar.setBackgroundResource(R.drawable.panel_bg);
 
         TextView title = new TextView(this);
-        title.setText("CABrush AVS 0.1.1");
+        title.setText(BuildConfig.ENGINE_DIAGNOSTICS
+                ? "CABrush AVS 0.1.1 DEV"
+                : "CABrush AVS 0.1.1");
         title.setTextColor(Color.WHITE);
         title.setTextSize(17f);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
         title.setGravity(Gravity.CENTER_VERTICAL);
         bar.addView(title, new LinearLayout.LayoutParams(0, dp(44), 1f));
+
+        if (BuildConfig.ENGINE_DIAGNOSTICS) {
+            Button dump = actionButton("Dump", v -> {
+                if (diagnostics != null) {
+                    diagnostics.requestManualDump("ui");
+                    Toast.makeText(this, "Diagnostic dump queued", Toast.LENGTH_SHORT).show();
+                }
+            });
+            bar.addView(dump);
+            bar.addView(spacer(6));
+        }
 
         Button reset = actionButton("Reset", v -> sculptView.resetMesh());
         bar.addView(reset);
@@ -194,12 +212,23 @@ public class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        if (diagnostics != null) diagnostics.onLifecycle("onResume");
         sculptView.onResume();
     }
 
     @Override protected void onPause() {
+        if (diagnostics != null) diagnostics.onLifecycle("onPause");
         sculptView.onPause();
         super.onPause();
+    }
+
+    @Override protected void onDestroy() {
+        if (diagnostics != null) {
+            diagnostics.onLifecycle("onDestroy");
+            diagnostics.shutdown();
+            diagnostics = null;
+        }
+        super.onDestroy();
     }
 
     private interface IntChange {

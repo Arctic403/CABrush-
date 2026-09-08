@@ -42,18 +42,23 @@ final class SculptMesh {
         return h.hit ? hitScratch.set(h) : null;
     }
 
-    boolean applyClay(float hitX,float hitY,float hitZ,
-                      float normalX,float normalY,float normalZ,
-                      float radius,float strength,BrushMode mode) {
-        AvsVolume.BrushResult r = volume.applyClay(
+    AvsVolume.BrushResult applyClay(float hitX,float hitY,float hitZ,
+                                     float normalX,float normalY,float normalZ,
+                                     float radius,float strength,BrushMode mode) {
+        return volume.applyClay(
                 hitX,hitY,hitZ,normalX,normalY,normalZ,radius,strength,mode
         );
-        return r.changed;
     }
 
     void reset() {
+        long start = EngineDiagnostics.nowNanos();
         resetSnapshot.restoreInto(volume);
         surface.rebuildAll();
+        if (EngineDiagnostics.isEnabled()) {
+            EngineDiagnostics.timed("mesh", "reset", start,
+                    "bricks=" + volume.brickCount()
+                            + " field_hash=" + volume.fieldHash());
+        }
     }
 
     AvsSurfaceCache.RenderPlan renderPlan() {
