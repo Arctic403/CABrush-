@@ -35,7 +35,7 @@ jobs:
 
       - name: Upload AVS VSS dump and screenshots
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CABrush-AVS-0.1.1-Surface-Truth-VSS
           path: app/build/vss/report/**
@@ -43,7 +43,7 @@ jobs:
 
       - name: Upload debug APK
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CABrush-AVS-0.1.1-debug
           path: app/build/outputs/apk/debug/app-debug.apk
